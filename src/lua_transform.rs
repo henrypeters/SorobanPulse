@@ -5,6 +5,7 @@
 //! return nil to skip events entirely.
 
 use crate::models::SorobanEvent;
+use crate::metrics;
 use anyhow::{Context, Result};
 use mlua::{Lua, Table, Value as LuaValue};
 use serde_json::Value;
@@ -17,12 +18,19 @@ use tracing::{debug, warn};
 pub struct LuaTransformer {
     lua: Arc<Lua>,
     timeout: Duration,
+    script_path: String,
 }
+
+const LUA_INSTRUCTION_LIMIT: u32 = 1_000_000;
+const LUA_MEMORY_LIMIT_MB: usize = 64;
 
 impl LuaTransformer {
     /// Create a new LuaTransformer by loading a script from the given path
     pub fn new(script_path: &Path, timeout_ms: u64) -> Result<Self> {
         let lua = Lua::new();
+        
+        // Set memory limit (in bytes)
+        lua.set_memory_limit(LUA_MEMORY_LIMIT_MB * 1024 * 1024)?;
         
         // Load the script
         let script_content = std::fs::read_to_string(script_path)
@@ -35,12 +43,15 @@ impl LuaTransformer {
         debug!(
             script_path = %script_path.display(),
             timeout_ms = timeout_ms,
+            instruction_limit = LUA_INSTRUCTION_LIMIT,
+            memory_limit_mb = LUA_MEMORY_LIMIT_MB,
             "Lua transformer initialized"
         );
         
         Ok(Self {
             lua: Arc::new(lua),
             timeout: Duration::from_millis(timeout_ms),
+            script_path: script_path.display().to_string(),
         })
     }
     
@@ -53,6 +64,7 @@ impl LuaTransformer {
     pub async fn transform(&self, event: SorobanEvent) -> Result<Option<SorobanEvent>> {
         let lua = self.lua.clone();
         let timeout = self.timeout;
+        let script_path = self.script_path.clone();
         
         // Run the Lua transformation in a blocking task with timeout
         let result = tokio::time::timeout(
@@ -63,11 +75,12 @@ impl LuaTransformer {
         match result {
             Ok(Ok(transformed)) => Ok(transformed),
             Ok(Err(e)) => {
-                warn!(error = %e, "Lua transformation failed");
+                warn!(error = %e, script_path = %script_path, "Lua transformation failed");
                 Err(e)
             }
             Err(_) => {
-                warn!(timeout_ms = ?timeout.as_millis(), "Lua script timeout");
+                warn!(timeout_ms = ?timeout.as_millis(), script_path = %script_path, "Lua script timeout");
+                metrics::record_lua_timeout();
                 Err(anyhow::anyhow!("Lua script execution timeout"))
             }
         }
@@ -75,6 +88,11 @@ impl LuaTransformer {
     
     /// Synchronous transformation logic
     fn transform_sync(lua: &Lua, event: SorobanEvent) -> Result<Option<SorobanEvent>> {
+        // Set instruction hook to limit CPU usage
+        lua.set_hook(mlua::HookTriggers::new().with_every_nth_instruction(1000), |_lua, _debug| {
+            Err(mlua::Error::external("Instruction limit exceeded"))
+        })?;
+        
         // Get the transform_event function from the Lua script
         let transform_fn: mlua::Function = lua
             .globals()
@@ -387,6 +405,54 @@ mod tests {
         .unwrap();
 
         let transformer = LuaTransformer::new(script_file.path(), 50).unwrap();
+        let event = create_test_event();
+        let result = transformer.transform(event).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_limit() {
+        let mut script_file = NamedTempFile::new().unwrap();
+        writeln!(
+            script_file,
+            r#"
+            function transform_event(event)
+                local t = {}
+                for i = 1, 10000000 do
+                    t[i] = string.rep("x", 1000)
+                end
+                return event
+            end
+            "#
+        )
+        .unwrap();
+
+        let transformer = LuaTransformer::new(script_file.path(), 5000).unwrap();
+        let event = create_test_event();
+        let result = transformer.transform(event).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_instruction_limit() {
+        let mut script_file = NamedTempFile::new().unwrap();
+        writeln!(
+            script_file,
+            r#"
+            function transform_event(event)
+                local sum = 0
+                for i = 1, 100000000 do
+                    sum = sum + i
+                end
+                return event
+            end
+            "#
+        )
+        .unwrap();
+
+        let transformer = LuaTransformer::new(script_file.path(), 5000).unwrap();
         let event = create_test_event();
         let result = transformer.transform(event).await;
 

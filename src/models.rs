@@ -83,6 +83,8 @@ pub struct PaginationParams {
     pub in_successful_call: Option<bool>,
     /// Filter by the first topic symbol (uses topic_0_sym generated column index).
     pub topic_sym: Option<String>,
+    /// Filter by topic array using JSONB containment (e.g., ?topic=["transfer"]).
+    pub topic: Option<String>,
     /// Full-text search query for event_data (uses event_data_tsv tsvector index).
     pub search: Option<String>,
     /// Filter events at or after this timestamp (ISO 8601 format).

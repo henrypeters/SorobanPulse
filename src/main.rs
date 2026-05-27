@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     if attempt >= 3 {
                         tracing::error!(error = %e, "Failed to connect to database after 3 attempts");
-                        std::process::exit(1);
+                        return Err(anyhow::anyhow!("Database connection failed after 3 attempts"));
                     }
                     tracing::warn!(attempt = attempt, "DB connection failed, retrying...");
                     tokio::time::sleep(Duration::from_secs(2)).await;

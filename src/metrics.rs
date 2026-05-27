@@ -122,6 +122,11 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
+/// Record a Lua script timeout
+pub fn record_lua_timeout() {
+    m::counter!("soroban_pulse_lua_timeout_total").increment(1);
+}
+
 pub fn record_replay_job() {
     m::counter!("soroban_pulse_replay_jobs_total").increment(1);
 }

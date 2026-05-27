@@ -1249,6 +1249,10 @@ pub async fn get_events(
             conditions.push(format!("topic_0_sym = ${bind_idx}"));
             bind_idx += 1;
         }
+        if topic_filter.is_some() {
+            conditions.push(format!("event_data->'topic' @> ${bind_idx}::jsonb"));
+            bind_idx += 1;
+        }
         if params.search.is_some() {
             conditions.push(format!("event_data_tsv @@ plainto_tsquery('english', ${bind_idx})"));
             bind_idx += 1;
@@ -1301,6 +1305,9 @@ pub async fn get_events(
         }
         if let Some(ref ts) = params.topic_sym {
             q = q.bind(ts);
+        }
+        if let Some(ref tf) = topic_filter {
+            q = q.bind(tf.to_string());
         }
         if let Some(ref search) = params.search {
             q = q.bind(search);
@@ -1391,6 +1398,10 @@ pub async fn get_events(
         conditions.push(format!("topic_0_sym = ${bind_idx}"));
         bind_idx += 1;
     }
+    if topic_filter.is_some() {
+        conditions.push(format!("event_data->'topic' @> ${bind_idx}::jsonb"));
+        bind_idx += 1;
+    }
     if params.search.is_some() {
         conditions.push(format!("event_data_tsv @@ plainto_tsquery('english', ${bind_idx})"));
         bind_idx += 1;
@@ -1453,6 +1464,9 @@ pub async fn get_events(
     if let Some(ref ts) = params.topic_sym {
         q = q.bind(ts);
     }
+    if let Some(ref tf) = topic_filter {
+        q = q.bind(tf.to_string());
+    }
     if let Some(ref search) = params.search {
         q = q.bind(search);
     }
@@ -1507,6 +1521,9 @@ pub async fn get_events(
         }
         if let Some(ref ts) = params.topic_sym {
             cq = cq.bind(ts);
+        }
+        if let Some(ref tf) = topic_filter {
+            cq = cq.bind(tf.to_string());
         }
         if let Some(ref search) = params.search {
             cq = cq.bind(search);
