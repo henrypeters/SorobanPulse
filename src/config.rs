@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+use secrecy::SecretString;
 
 /// Load an optional TOML config file. Returns an empty table if the file is
 /// absent or CONFIG_FILE is not set — never an error.
@@ -156,7 +157,7 @@ pub struct Config {
     pub start_ledger: u64,
     pub start_ledger_fallback: bool,
     pub port: u16,
-    pub api_keys: Vec<String>,
+    pub api_keys: Vec<SecretString>,
     pub db_max_connections: u32,
     pub db_min_connections: u32,
     pub db_idle_timeout_secs: u64,
@@ -230,7 +231,7 @@ pub struct Config {
     pub email_smtp_host: Option<String>,
     pub email_smtp_port: u16,
     pub email_smtp_user: Option<String>,
-    pub email_smtp_password: Option<String>,
+    pub email_smtp_password: Option<SecretString>,
     pub email_from: Option<String>,
     pub email_to: Vec<String>,
     pub email_contract_filter: Vec<String>,
@@ -909,10 +910,10 @@ impl Config {
             api_keys: {
                 let mut keys = Vec::new();
                 if let Some(key) = env_or_file("API_KEY", &file) {
-                    keys.push(key);
+                    keys.push(SecretString::new(key));
                 }
                 if let Some(key) = env_or_file("API_KEY_SECONDARY", &file) {
-                    keys.push(key);
+                    keys.push(SecretString::new(key));
                 }
                 keys
             },
@@ -983,7 +984,8 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(587),
             email_smtp_user: env_or_file("EMAIL_SMTP_USER", &file),
-            email_smtp_password: env_or_file("EMAIL_SMTP_PASSWORD", &file),
+            email_smtp_password: env_or_file("EMAIL_SMTP_PASSWORD", &file)
+                .map(SecretString::new),
             email_from: env_or_file("EMAIL_FROM", &file),
             email_to: env_or_file("EMAIL_TO", &file)
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())

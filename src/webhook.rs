@@ -4,6 +4,7 @@ use sha2::Sha256;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{metrics, models::SorobanEvent};
 
@@ -19,9 +20,14 @@ pub fn sign_payload(secret: &str, body: &[u8]) -> String {
 }
 
 /// Deliver a single event to the webhook URL with up to 3 retries and
-/// exponential backoff (1s, 2s, 4s). This is fire-and-forget: the caller
-/// spawns this as a background task and does not await the result.
-pub async fn deliver(client: Client, url: String, secret: Option<String>, event: SorobanEvent) {
+/// exponential backoff (1s, 2s, 4s). On final failure, insert into DLQ.
+pub async fn deliver(
+    client: Client,
+    url: String,
+    secret: Option<String>,
+    event: SorobanEvent,
+    pool: Option<&sqlx::PgPool>,
+) {
     let body = match serde_json::to_vec(&event) {
         Ok(b) => b,
         Err(e) => {
@@ -78,6 +84,28 @@ pub async fn deliver(client: Client, url: String, secret: Option<String>, event:
     }
 
     error!(url = %url, contract_id = %event.contract_id, "Webhook delivery failed after 3 attempts");
+    
+    // Insert into DLQ if pool is available
+    if let Some(pool) = pool {
+        let payload = serde_json::to_value(&event).unwrap_or(serde_json::json!({}));
+        let next_retry = chrono::Utc::now() + chrono::Duration::seconds(60);
+        
+        if let Err(e) = sqlx::query(
+            "INSERT INTO webhook_failures (url, payload, attempts, last_error, next_retry_at) 
+             VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(&url)
+        .bind(payload)
+        .bind(3i32)
+        .bind("Failed after 3 retries")
+        .bind(next_retry)
+        .execute(pool)
+        .await
+        {
+            error!(error = %e, "Failed to insert webhook failure into DLQ");
+        }
+    }
+    
     metrics::record_webhook_failure();
 }
 
