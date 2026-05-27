@@ -26,8 +26,10 @@ mod normalizer;
 #[cfg(feature = "parquet")]
 mod parquet_export;
 
+mod pruner;
 mod pubsub;
 mod queue_publisher;
+mod reencrypt;
 mod routes;
 mod rpc_client;
 mod schema_validator;
@@ -126,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     if attempt >= 3 {
                         tracing::error!(error = %e, "Failed to connect to database after 3 attempts");
-                        std::process::exit(1);
+                        return Err(anyhow::anyhow!("Database connection failed after 3 attempts"));
                     }
                     tracing::warn!(attempt = attempt, "DB connection failed, retrying...");
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -385,7 +387,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx.clone(),
     );
 
-    async fn shutdown_signal() {
+    async fn shutdown_signal(event_tx: broadcast::Sender<models::SorobanEvent>, sse_drain_timeout_secs: u64) {
         #[cfg(unix)]
         {
             let mut sigterm =
@@ -403,6 +405,12 @@ async fn main() -> anyhow::Result<()> {
 
         tracing::info!("Graceful shutdown initiated, draining requests...");
 
+        // Drop the broadcast sender to signal SSE streams to close
+        drop(event_tx);
+
+        // Wait for SSE connections to drain
+        tokio::time::sleep(Duration::from_secs(sse_drain_timeout_secs)).await;
+
         tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(30)).await;
             tracing::info!("Graceful shutdown timeout reached (30s), forcing exit");
@@ -410,8 +418,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let event_tx_clone = event_tx.clone();
+    let sse_drain_timeout = config.sse_drain_timeout_secs;
     tokio::spawn(async move {
-        shutdown_signal().await;
+        shutdown_signal(event_tx_clone, sse_drain_timeout).await;
         let _ = shutdown_tx.send(true);
     });
 

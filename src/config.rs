@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+use secrecy::SecretString;
 
 /// Load an optional TOML config file. Returns an empty table if the file is
 /// absent or CONFIG_FILE is not set — never an error.
@@ -156,7 +157,7 @@ pub struct Config {
     pub start_ledger: u64,
     pub start_ledger_fallback: bool,
     pub port: u16,
-    pub api_keys: Vec<String>,
+    pub api_keys: Vec<SecretString>,
     pub db_max_connections: u32,
     pub db_min_connections: u32,
     pub db_idle_timeout_secs: u64,
@@ -174,6 +175,7 @@ pub struct Config {
     pub indexer_error_backoff_ms: u64,
     pub sse_keepalive_interval_ms: u64,
     pub sse_max_connections: usize,
+    pub sse_drain_timeout_secs: u64,
     pub environment: Environment,
     pub max_body_size_bytes: usize,
     pub log_sample_rate: u32,
@@ -229,7 +231,7 @@ pub struct Config {
     pub email_smtp_host: Option<String>,
     pub email_smtp_port: u16,
     pub email_smtp_user: Option<String>,
-    pub email_smtp_password: Option<String>,
+    pub email_smtp_password: Option<SecretString>,
     pub email_from: Option<String>,
     pub email_to: Vec<String>,
     pub email_contract_filter: Vec<String>,
@@ -240,10 +242,11 @@ pub struct Config {
     pub redis_buffer_max_size: usize,
     // Stats refresh
     pub stats_refresh_interval_secs: u64,
-    /// Comma-separated list of fallback Soroban RPC URLs tried in order when the primary fails.
-    pub stellar_rpc_fallback_urls: Vec<String>,
-    /// Kinesis partition key strategy: contract_id (default), tx_hash, or random.
-    pub kinesis_partition_key_field: String,
+    // Issue #327: Event retention and pruning
+    pub retention_days: u64,
+    pub pruning_interval_hours: u64,
+    // Issue #325: SSE Last-Event-ID replay limit
+    pub sse_replay_limit: u64,
 }
 
 impl Default for Config {
@@ -274,6 +277,7 @@ impl Default for Config {
             indexer_error_backoff_ms: 10000,
             sse_keepalive_interval_ms: 15000,
             sse_max_connections: 1000,
+            sse_drain_timeout_secs: 5,
             environment: Environment::Development,
             max_body_size_bytes: 1024 * 1024, // 1 MB default
             log_sample_rate: 1,
@@ -312,8 +316,9 @@ impl Default for Config {
             redis_stream_key: None,
             redis_buffer_max_size: 10_000,
             stats_refresh_interval_secs: 3600,
-            stellar_rpc_fallback_urls: Vec::new(),
-            kinesis_partition_key_field: "contract_id".to_string(),
+            retention_days: 90,
+            pruning_interval_hours: 24,
+            sse_replay_limit: 500,
         }
     }
 }
@@ -792,6 +797,16 @@ impl Config {
         )
         .unwrap_or(1000);
 
+        let sse_drain_timeout_secs = parse_int_range::<u64>(
+            "SSE_DRAIN_TIMEOUT_SECS",
+            &env_or_file_or("SSE_DRAIN_TIMEOUT_SECS", &file, "5"),
+            1,
+            60,
+            "5",
+            &mut errors,
+        )
+        .unwrap_or(5);
+
         let max_body_size_bytes = parse_int::<usize>(
             "MAX_BODY_SIZE_BYTES",
             &env_or_file_or("MAX_BODY_SIZE_BYTES", &file, "1048576"),
@@ -898,10 +913,10 @@ impl Config {
             api_keys: {
                 let mut keys = Vec::new();
                 if let Some(key) = env_or_file("API_KEY", &file) {
-                    keys.push(key);
+                    keys.push(SecretString::new(key));
                 }
                 if let Some(key) = env_or_file("API_KEY_SECONDARY", &file) {
-                    keys.push(key);
+                    keys.push(SecretString::new(key));
                 }
                 keys
             },
@@ -922,6 +937,7 @@ impl Config {
             indexer_error_backoff_ms,
             sse_keepalive_interval_ms,
             sse_max_connections,
+            sse_drain_timeout_secs,
             environment,
             max_body_size_bytes,
             log_sample_rate,
@@ -971,7 +987,8 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(587),
             email_smtp_user: env_or_file("EMAIL_SMTP_USER", &file),
-            email_smtp_password: env_or_file("EMAIL_SMTP_PASSWORD", &file),
+            email_smtp_password: env_or_file("EMAIL_SMTP_PASSWORD", &file)
+                .map(SecretString::new),
             email_from: env_or_file("EMAIL_FROM", &file),
             email_to: env_or_file("EMAIL_TO", &file)
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
@@ -987,21 +1004,15 @@ impl Config {
             stats_refresh_interval_secs: env_or_file("STATS_REFRESH_INTERVAL_SECS", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
-            stellar_rpc_fallback_urls: env_or_file("STELLAR_RPC_FALLBACK_URLS", &file)
-                .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-                .unwrap_or_default(),
-            kinesis_partition_key_field: {
-                let field = env_or_file_or("KINESIS_PARTITION_KEY_FIELD", &file, "contract_id");
-                if !["contract_id", "tx_hash", "random"].contains(&field.as_str()) {
-                    errors.push(format!(
-                        "  KINESIS_PARTITION_KEY_FIELD={field:?} is invalid. \
-                         Valid values: contract_id, tx_hash, random."
-                    ));
-                    "contract_id".to_string()
-                } else {
-                    field
-                }
-            },
+            retention_days: env_or_file("RETENTION_DAYS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90),
+            pruning_interval_hours: env_or_file("PRUNING_INTERVAL_HOURS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24),
+            sse_replay_limit: env_or_file("SSE_REPLAY_LIMIT", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500),
         }
     }
 }

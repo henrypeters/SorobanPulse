@@ -36,6 +36,7 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+subtle = "2.5"
 aes-gcm = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
 
@@ -47,6 +48,10 @@ bloomfilter = "3"
 
 # Issue #268: Contract count cache
 moka = { version = "0.12", features = ["future"] }
+
+# Issue #367: Zeroizing secrets
+secrecy = { version = "0.8", features = ["serde"] }
+
 
 # Issue #265: AWS Kinesis streaming (optional, behind kinesis feature flag)
 aws-sdk-kinesis = { version = "1", optional = true }

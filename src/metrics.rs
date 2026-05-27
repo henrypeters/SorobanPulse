@@ -72,9 +72,39 @@ pub fn record_xdr_invalid() {
     m::counter!("soroban_pulse_events_xdr_invalid_total").increment(1);
 }
 
+/// Record an invalid contract ID (issue #370)
+pub fn record_invalid_contract_id() {
+    m::counter!("soroban_pulse_events_invalid_contract_id_total").increment(1);
+}
+
+/// Record an archive integrity failure (issue #371)
+pub fn record_archive_integrity_failure() {
+    m::counter!("soroban_pulse_archive_integrity_failures_total").increment(1);
+}
+
+/// Update re-encryption progress gauge (issue #372)
+pub fn update_reencrypt_progress(remaining: u64) {
+    m::gauge!("soroban_pulse_reencrypt_progress").set(remaining as f64);
+}
+
+/// Record a re-encryption error (issue #372)
+pub fn record_reencrypt_error() {
+    m::counter!("soroban_pulse_reencrypt_errors_total").increment(1);
+}
+
 /// Record a bloom filter hit (pre-filtered duplicate) (issue #266)
 pub fn record_bloom_filter_hit() {
     m::counter!("soroban_pulse_bloom_filter_hits_total").increment(1);
+}
+
+/// Update the bloom filter size gauge (number of set bits) (issue #369)
+pub fn update_bloom_filter_size(size: u64) {
+    m::gauge!("soroban_pulse_bloom_filter_size").set(size as f64);
+}
+
+/// Record a normalizer error (issue #368)
+pub fn record_normalizer_error() {
+    m::counter!("soroban_pulse_normalizer_errors_total").increment(1);
 }
 
 /// Record a Kinesis publish failure (issue #265)
@@ -137,8 +167,18 @@ pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
 }
 
+/// Record a Lua script timeout
+pub fn record_lua_timeout() {
+    m::counter!("soroban_pulse_lua_timeout_total").increment(1);
+}
+
 pub fn record_replay_job() {
     m::counter!("soroban_pulse_replay_jobs_total").increment(1);
+}
+
+/// Record events pruned
+pub fn increment_events_pruned(count: u64) {
+    m::counter!("soroban_pulse_events_pruned_total").increment(count);
 }
 
 /// Record HTTP request duration
