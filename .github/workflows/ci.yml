@@ -245,21 +245,18 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: sudo apt-get install -y pkg-config libssl-dev
-      # Build the spec-dump binary and generate the spec
-      - run: cargo build --bin dump_openapi
-      - run: ./target/debug/dump_openapi > /tmp/openapi-generated.json
-      # Validate the generated spec against OpenAPI 3.0 schema using spectral@6.11.1
+      - name: Generate OpenAPI spec
+        run: cargo run --bin gen_openapi > /tmp/openapi-generated.json
+      - name: Check openapi.json is up to date
+        run: |
+          if ! diff -q openapi.json /tmp/openapi-generated.json > /dev/null 2>&1; then
+            echo "OpenAPI spec is out of date — run make gen-openapi and commit the result"
+            diff openapi.json /tmp/openapi-generated.json
+            exit 1
+          fi
+      - name: Copy spec to docs for Swagger UI
+        run: cp openapi.json docs/openapi.json
       - name: Install Spectral
         run: npm install -g @stoplight/spectral-cli@6.11.1
       - name: Validate OpenAPI spec
-        run: spectral lint /tmp/openapi-generated.json --ruleset https://unpkg.com/@stoplight/spectral-openapi/dist/ruleset.js
-      # Verify the committed docs/openapi.json matches the generated spec
-      - name: Check committed spec is up to date
-        run: |
-          ./target/debug/dump_openapi > /tmp/openapi-fresh.json
-          if ! diff -q docs/openapi.json /tmp/openapi-fresh.json > /dev/null 2>&1; then
-            echo "docs/openapi.json is out of date. Run './target/debug/dump_openapi > docs/openapi.json' and commit the result."
-            diff docs/openapi.json /tmp/openapi-fresh.json
-            exit 1
-          fi
-          echo "docs/openapi.json is up to date."
+        run: spectral lint openapi.json --ruleset https://unpkg.com/@stoplight/spectral-openapi/dist/ruleset.js

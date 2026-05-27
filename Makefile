@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build test test-db lint fmt run docker-up docker-down migrate clean
+.PHONY: help build test test-db lint fmt run docker-up docker-down migrate clean gen-openapi
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*##"}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -43,6 +43,10 @@ migrate-down: ## Rollback the most recent migration
 clean: ## Remove build artifacts
 	cargo clean
 	rm -f openapi.json
+
+gen-openapi: ## Regenerate openapi.json from handler signatures and sync docs/openapi.json
+	cargo run --bin gen_openapi > openapi.json
+	cp openapi.json docs/openapi.json
 
 generate-sdk: ## Generate TypeScript and Python SDKs from OpenAPI spec
 	cargo run --bin gen_openapi > openapi.json

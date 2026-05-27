@@ -9,3 +9,6 @@ pre-commit:
     clippy:
       run: cargo clippy -- -D warnings
       glob: "*.rs"
+    gen-openapi:
+      run: cargo run --bin gen_openapi > openapi.json && cp openapi.json docs/openapi.json && git add openapi.json docs/openapi.json
+      glob: "*.rs"
