@@ -416,6 +416,25 @@ pub async fn status(State(state): State<AppState>) -> Json<Value> {
 pub async fn get_event_stats(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     use std::collections::HashMap;
 
+    let cache_key = "stats";
+
+    // Try to get from cache
+    if let Some(cached) = state.stats_cache.get(cache_key).await {
+        crate::metrics::record_stats_cache_hit();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_str(&format!(
+                "public, max-age={}",
+                state.config.stats_cache_ttl_secs
+            ))
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("public, max-age=30")),
+        );
+        return Ok((headers, Json(cached)));
+    }
+
+    crate::metrics::record_stats_cache_miss();
+
     // Total events and ledger range from raw table (fast with index)
     let totals_row = sqlx::query(
         "SELECT COUNT(*) AS total_events, MIN(ledger) AS min_ledger, MAX(ledger) AS max_ledger FROM events",
@@ -485,13 +504,25 @@ pub async fn get_event_stats(State(state): State<AppState>) -> Result<impl IntoR
         computed_at: Utc::now(),
     };
 
+    let stats_json = serde_json::to_value(&stats)?;
+
+    // Store in cache
+    state
+        .stats_cache
+        .insert(cache_key.to_string(), stats_json.clone())
+        .await;
+
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("public, max-age=60"),
+        axum::http::HeaderValue::from_str(&format!(
+            "public, max-age={}",
+            state.config.stats_cache_ttl_secs
+        ))
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("public, max-age=30")),
     );
 
-    Ok((headers, Json(stats)))
+    Ok((headers, Json(stats_json)))
 }
 
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -976,8 +1007,9 @@ async fn stream_events_internal(
             enc_key_old,
             tenant_id,
             false, // closed
+            state.shutdown_rx.clone(),
         ),
-        move |(mut rx, filter, ka, cols, ek, ek_old, tid, closed)| async move {
+        move |(mut rx, filter, ka, cols, ek, ek_old, tid, closed, mut shutdown_rx)| async move {
             if closed {
                 return None;
             }
@@ -1004,18 +1036,23 @@ async fn stream_events_internal(
                                 .id(event.id.to_string())
                                 .retry(Duration::from_millis(ka))
                                 .data(data);
-                            return Some((Ok(sse), (rx, filter, ka, cols, ek, ek_old, tid, false)));
+                            return Some((Ok(sse), (rx, filter, ka, cols, ek, ek_old, tid, false, shutdown_rx)));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             let close_event = Event::default().event("close").data("stream closed");
-                            return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, true)));
+                            return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, true, shutdown_rx)));
                         }
                     },
                     _ = interval.tick() => {
                         let ts = chrono::Utc::now().to_rfc3339();
                         let ping = Event::default().event("ping").data(ts);
-                        return Some((Ok(ping), (rx, filter, ka, cols, ek, ek_old, tid, false)));
+                        return Some((Ok(ping), (rx, filter, ka, cols, ek, ek_old, tid, false, shutdown_rx)));
+                    }
+                    _ = shutdown_rx.changed() => {
+                        // Server is shutting down, emit close event
+                        let close_event = Event::default().event("close").data("server shutting down");
+                        return Some((Ok(close_event), (rx, filter, ka, cols, ek, ek_old, tid, true, shutdown_rx)));
                     }
                 }
             }
@@ -2162,10 +2199,11 @@ pub async fn get_events_by_tx_batch(
     State(state): State<AppState>,
     Json(body): Json<crate::models::BatchTxRequest>,
 ) -> Result<Json<Value>, AppError> {
-    if body.hashes.len() > 100 {
-        return Err(AppError::Validation(
-            "too many hashes: maximum is 100".to_string(),
-        ));
+    if body.hashes.len() > state.config.batch_tx_max_size {
+        return Err(AppError::Validation(format!(
+            "too many hashes: maximum is {}",
+            state.config.batch_tx_max_size
+        )));
     }
 
     // Validate all hashes; collect invalid ones for a helpful error.
@@ -2182,7 +2220,13 @@ pub async fn get_events_by_tx_batch(
         )));
     }
 
-    let hashes: Vec<String> = body.hashes.iter().map(|h| h.to_lowercase()).collect();
+    // Deduplicate hashes using HashSet
+    let mut unique_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in &body.hashes {
+        unique_hashes.insert(h.to_lowercase());
+    }
+    let deduplicated_count = unique_hashes.len();
+    let hashes: Vec<String> = unique_hashes.into_iter().collect();
 
     // Single query using ANY().
     let rows = sqlx::query(
@@ -2225,7 +2269,11 @@ pub async fn get_events_by_tx_batch(
         }
     }
 
-    Ok(Json(Value::Object(result)))
+    // Add deduplicated_count to response
+    let mut response_obj = result;
+    response_obj.insert("deduplicated_count".to_string(), Value::Number(deduplicated_count.into()));
+
+    Ok(Json(Value::Object(response_obj)))
 }
 
 #[utoipa::path(

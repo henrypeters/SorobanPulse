@@ -247,6 +247,12 @@ pub struct Config {
     pub pruning_interval_hours: u64,
     // Issue #325: SSE Last-Event-ID replay limit
     pub sse_replay_limit: u64,
+    // Issue #403: Batch TX max size limit
+    pub batch_tx_max_size: usize,
+    // Issue #404: Stats cache TTL
+    pub stats_cache_ttl_secs: u64,
+    // Issue #405: SSE shutdown grace period
+    pub sse_shutdown_grace_period_ms: u64,
 }
 
 impl Default for Config {
@@ -319,6 +325,9 @@ impl Default for Config {
             retention_days: 90,
             pruning_interval_hours: 24,
             sse_replay_limit: 500,
+            batch_tx_max_size: 100,
+            stats_cache_ttl_secs: 30,
+            sse_shutdown_grace_period_ms: 1000,
         }
     }
 }
@@ -1013,6 +1022,27 @@ impl Config {
             sse_replay_limit: env_or_file("SSE_REPLAY_LIMIT", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
+            batch_tx_max_size: parse_int::<usize>(
+                "BATCH_TX_MAX_SIZE",
+                &env_or_file_or("BATCH_TX_MAX_SIZE", &file, "100"),
+                "100",
+                &mut errors,
+            )
+            .unwrap_or(100),
+            stats_cache_ttl_secs: parse_int::<u64>(
+                "STATS_CACHE_TTL_SECS",
+                &env_or_file_or("STATS_CACHE_TTL_SECS", &file, "30"),
+                "30",
+                &mut errors,
+            )
+            .unwrap_or(30),
+            sse_shutdown_grace_period_ms: parse_int::<u64>(
+                "SSE_SHUTDOWN_GRACE_PERIOD_MS",
+                &env_or_file_or("SSE_SHUTDOWN_GRACE_PERIOD_MS", &file, "1000"),
+                "1000",
+                &mut errors,
+            )
+            .unwrap_or(1000),
         }
     }
 }

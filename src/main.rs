@@ -387,7 +387,12 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx.clone(),
     );
 
-    async fn shutdown_signal(event_tx: broadcast::Sender<models::SorobanEvent>, sse_drain_timeout_secs: u64) {
+    async fn shutdown_signal(
+        event_tx: broadcast::Sender<models::SorobanEvent>,
+        sse_drain_timeout_secs: u64,
+        sse_shutdown_grace_period_ms: u64,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) {
         #[cfg(unix)]
         {
             let mut sigterm =
@@ -403,7 +408,13 @@ async fn main() -> anyhow::Result<()> {
             tokio::signal::ctrl_c().await.ok();
         }
 
-        tracing::info!("Graceful shutdown initiated, draining requests...");
+        tracing::info!("Graceful shutdown initiated, sending close event to SSE clients...");
+
+        // Signal SSE streams to emit close event
+        let _ = shutdown_tx.send(true);
+
+        // Wait for SSE clients to receive the close event
+        tokio::time::sleep(Duration::from_millis(sse_shutdown_grace_period_ms)).await;
 
         // Drop the broadcast sender to signal SSE streams to close
         drop(event_tx);
@@ -420,9 +431,10 @@ async fn main() -> anyhow::Result<()> {
 
     let event_tx_clone = event_tx.clone();
     let sse_drain_timeout = config.sse_drain_timeout_secs;
+    let sse_shutdown_grace_period = config.sse_shutdown_grace_period_ms;
+    let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
-        shutdown_signal(event_tx_clone, sse_drain_timeout).await;
-        let _ = shutdown_tx.send(true);
+        shutdown_signal(event_tx_clone, sse_drain_timeout, sse_shutdown_grace_period, shutdown_tx_clone).await;
     });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -469,6 +481,7 @@ async fn main() -> anyhow::Result<()> {
         config.clone(),
         Some(schema_validator),
         tenant_map,
+        shutdown_rx.clone(),
     );
 
     info!(addr = %addr, "Soroban Pulse listening");

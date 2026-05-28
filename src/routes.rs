@@ -61,6 +61,10 @@ pub struct AppState {
     pub schema_validator: Option<Arc<crate::schema_validator::SchemaValidator>>,
     /// key_hash → tenant_id; populated only when multi_tenant is enabled.
     pub tenant_map: Arc<std::collections::HashMap<String, String>>,
+    /// Cache for stats results (Issue #404)
+    pub stats_cache: moka::future::Cache<String, serde_json::Value>,
+    /// Shutdown signal for SSE streams (Issue #405)
+    pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -230,6 +234,7 @@ pub fn create_router_with_tx_and_tenant_map(
     config: crate::config::Config,
     schema_validator: Option<Arc<crate::schema_validator::SchemaValidator>>,
     tenant_map: Arc<std::collections::HashMap<String, String>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Router {
     let cors = build_cors(allowed_origins);
 
@@ -243,6 +248,10 @@ pub fn create_router_with_tx_and_tenant_map(
         .time_to_live(std::time::Duration::from_secs(
             config.contract_count_cache_ttl_secs,
         ))
+        .build();
+    let stats_cache = moka::future::Cache::builder()
+        .max_capacity(1)
+        .time_to_live(std::time::Duration::from_secs(config.stats_cache_ttl_secs))
         .build();
     let app_state = AppState {
         pool,
@@ -261,6 +270,8 @@ pub fn create_router_with_tx_and_tenant_map(
         config,
         schema_validator,
         tenant_map,
+        stats_cache,
+        shutdown_rx,
     };
 
     // Build governor config: burst = rate_limit_per_minute, replenish 1 token per (60/rate) seconds.

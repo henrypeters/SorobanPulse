@@ -202,6 +202,16 @@ pub fn update_sse_connections(count: usize) {
     m::gauge!("soroban_pulse_sse_active_connections").set(count as f64);
 }
 
+/// Record a stats cache hit (Issue #404)
+pub fn record_stats_cache_hit() {
+    m::counter!("soroban_pulse_stats_cache_hit_total").increment(1);
+}
+
+/// Record a stats cache miss (Issue #404)
+pub fn record_stats_cache_miss() {
+    m::counter!("soroban_pulse_stats_cache_miss_total").increment(1);
+}
+
 /// Update DB connection pool metrics
 pub fn update_db_pool_metrics(pool: &PgPool) {
     m::gauge!("soroban_pulse_db_pool_size").set(pool.size() as f64);
