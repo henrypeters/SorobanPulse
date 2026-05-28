@@ -1,10 +1,11 @@
-use jsonschema::{Draft, JSONSchema};
+use jsonschema::{Draft, JSONSchema, error::ValidationError};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+use crate::error::ValidationErrorDetail;
 
 /// Schema validator that caches compiled JSON schemas per contract
 #[derive(Clone)]
@@ -85,13 +86,13 @@ impl SchemaValidator {
     /// Validate event data against the registered schema for a contract
     /// Returns:
     /// - None if no schema is registered for this contract
-    /// - Some(true) if validation passes
-    /// - Some(false) if validation fails
+    /// - Some((true, vec![])) if validation passes
+    /// - Some((false, errors)) if validation fails with error details
     pub async fn validate_event_data(
         &self,
         contract_id: &str,
         event_data: &Value,
-    ) -> Option<bool> {
+    ) -> Option<(bool, Vec<ValidationErrorDetail>)> {
         let cache = self.cache.read().await;
         let schema = cache.get(contract_id)?;
 
@@ -99,18 +100,30 @@ impl SchemaValidator {
         
         if !is_valid {
             if let Err(errors) = schema.validate(event_data) {
-                let error_messages: Vec<String> = errors
-                    .map(|e| format!("{}", e))
+                let error_details: Vec<ValidationErrorDetail> = errors
+                    .map(|e| ValidationErrorDetail {
+                        instance_path: e.instance_path.to_string(),
+                        schema_path: e.schema_path.to_string(),
+                        message: e.to_string(),
+                    })
                     .collect();
+                
+                let error_messages: Vec<String> = error_details
+                    .iter()
+                    .map(|e| format!("{} at {}", e.message, e.instance_path))
+                    .collect();
+                
                 warn!(
                     contract_id = %contract_id,
                     errors = ?error_messages,
                     "Event data failed schema validation"
                 );
+                
+                return Some((false, error_details));
             }
         }
 
-        Some(is_valid)
+        Some((is_valid, vec![]))
     }
 
     /// Get the schema for a contract

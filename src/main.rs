@@ -322,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
         config.pubsub_project_id.clone(),
         config.pubsub_topic_id.clone(),
     ) {
-        match pubsub::gcp::GcpPubSubPublisher::from_env(project_id, topic_id).await {
+        match pubsub::gcp::GcpPubSubPublisher::from_env(project_id, topic_id, config.pubsub_enable_message_ordering).await {
             Ok(publisher) => {
                 indexer.set_pubsub_publisher(std::sync::Arc::new(publisher));
                 info!("Pub/Sub publisher enabled");

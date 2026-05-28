@@ -29,18 +29,19 @@ pub mod gcp {
     pub struct GcpPubSubPublisher {
         publisher: Publisher,
         topic: String,
+        enable_ordering: bool,
     }
 
     impl GcpPubSubPublisher {
         /// Build a publisher using Application Default Credentials.
-        pub async fn from_env(project_id: String, topic_id: String) -> Result<Self, String> {
+        pub async fn from_env(project_id: String, topic_id: String, enable_ordering: bool) -> Result<Self, String> {
             let topic = format!("projects/{project_id}/topics/{topic_id}");
             let publisher = Publisher::builder(&topic)
                 .build()
                 .await
                 .map_err(|e| format!("Failed to create Pub/Sub publisher: {e}"))?;
-            info!(topic = %topic, "Pub/Sub publisher initialised");
-            Ok(Self { publisher, topic })
+            info!(topic = %topic, enable_ordering = %enable_ordering, "Pub/Sub publisher initialised");
+            Ok(Self { publisher, topic, enable_ordering })
         }
     }
 
@@ -51,12 +52,17 @@ pub mod gcp {
                 serde_json::to_vec(event).map_err(|e| format!("serialisation error: {e}"))?;
 
             let ledger_str = event.ledger.to_string();
-            let msg = Message::new().set_data(payload).set_attributes([
+            let mut msg = Message::new().set_data(payload).set_attributes([
                 ("contract_id", event.contract_id.as_str()),
                 ("event_type", event.event_type.as_str()),
                 ("tx_hash", event.tx_hash.as_str()),
                 ("ledger", ledger_str.as_str()),
             ]);
+
+            if self.enable_ordering {
+                msg = msg.set_ordering_key(&event.contract_id);
+                metrics::record_pubsub_ordering_key_set();
+            }
 
             self.publisher.publish(msg).await.map_err(|e| {
                 let msg = e.to_string();
@@ -90,7 +96,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockPubSubPublisher {
-        published: Arc<Mutex<Vec<(String, String)>>>,
+        published: Arc<Mutex<Vec<(String, String, bool)>>>,
         fail: bool,
     }
 
@@ -103,7 +109,7 @@ mod tests {
             self.published
                 .lock()
                 .unwrap()
-                .push((event.contract_id.clone(), event.event_type.clone()));
+                .push((event.contract_id.clone(), event.event_type.clone(), false));
             Ok(())
         }
     }
@@ -129,7 +135,8 @@ mod tests {
         };
         mock.publish(&make_event()).await.unwrap();
         let records = published.lock().unwrap();
-        assert_eq!(records[0], ("CABC123".into(), "contract".into()));
+        assert_eq!(records[0].0, "CABC123");
+        assert_eq!(records[0].1, "contract");
     }
 
     #[tokio::test]

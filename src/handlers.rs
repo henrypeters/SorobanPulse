@@ -6826,3 +6826,50 @@ pub async fn delete_contract_schema(
         Err(AppError::NotFound)
     }
 }
+
+/// Validate event data against a contract's JSON Schema
+#[utoipa::path(
+    post,
+    path = "/v1/admin/contracts/{contract_id}/validate",
+    tag = "admin",
+    params(
+        ("contract_id" = String, Path, description = "Contract ID")
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Validation result"),
+        (status = 400, description = "Validation failed with error details"),
+        (status = 404, description = "No schema registered for this contract"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn validate_event_data_against_schema(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+    Json(event_data): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    validate_contract_id(&contract_id)?;
+
+    let validator = state.schema_validator
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Schema validator not initialized".to_string()))?;
+
+    match validator.validate_event_data(&contract_id, &event_data).await {
+        None => Err(AppError::NotFound),
+        Some((true, _)) => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "valid": true,
+                "message": "Event data is valid"
+            }))
+        )),
+        Some((false, errors)) => {
+            let error_msg = format!("Event data validation failed with {} error(s)", errors.len());
+            Err(AppError::ValidationWithDetails(error_msg, errors))
+        }
+    }
+}

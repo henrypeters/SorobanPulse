@@ -207,6 +207,8 @@ pub struct Config {
     // Issue #264: GCP Pub/Sub streaming
     pub pubsub_project_id: Option<String>,
     pub pubsub_topic_id: Option<String>,
+    // Issue #398: Pub/Sub message ordering
+    pub pubsub_enable_message_ordering: bool,
     /// Maximum allowed size of serialized event_data in bytes.
     pub max_event_data_bytes: usize,
     /// Maximum rows for CSV/JSON export.
@@ -301,6 +303,7 @@ impl Default for Config {
             aws_region: None,
             pubsub_project_id: None,
             pubsub_topic_id: None,
+            pubsub_enable_message_ordering: true,
             max_event_data_bytes: 65536,
             export_max_rows: 10_000,
             contract_count_cache_size: 1000,
@@ -982,6 +985,9 @@ impl Config {
             aws_region: env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
             pubsub_project_id: env::var("PUBSUB_PROJECT_ID").ok().filter(|s| !s.is_empty()),
             pubsub_topic_id: env::var("PUBSUB_TOPIC_ID").ok().filter(|s| !s.is_empty()),
+            pubsub_enable_message_ordering: env_or_file("PUBSUB_ENABLE_MESSAGE_ORDERING", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or(true),
             max_event_data_bytes: parse_int::<usize>(
                 "MAX_EVENT_DATA_BYTES",
                 &env_or_file_or("MAX_EVENT_DATA_BYTES", &file, "65536"),

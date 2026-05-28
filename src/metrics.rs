@@ -127,6 +127,11 @@ pub fn record_pubsub_publish_failure() {
     m::counter!("soroban_pulse_pubsub_publish_failures_total").increment(1);
 }
 
+/// Record a Pub/Sub message with ordering key set (issue #398)
+pub fn record_pubsub_ordering_key_set() {
+    m::counter!("soroban_pulse_pubsub_ordering_key_set_total").increment(1);
+}
+
 /// Record a rate-limited request rejection (429 Too Many Requests)
 pub fn record_rate_limit_rejected() {
     m::counter!("soroban_pulse_rate_limit_rejected_total").increment(1);
