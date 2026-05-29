@@ -2678,6 +2678,111 @@ pub async fn anonymize_event(
     Ok(Json(json!({ "id": id, "anonymized": true })))
 }
 
+/// Delete all events for a contract (GDPR right-to-erasure).
+/// Optionally anonymize instead of deleting with `anonymize_only=true`.
+/// Logs deletion request for audit purposes.
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/events/contract/{contract_id}",
+    tag = "admin",
+    params(
+        ("contract_id" = String, Path, description = "Contract ID"),
+        ("anonymize_only" = Option<bool>, Query, description = "If true, anonymize instead of deleting (default: false)"),
+    ),
+    responses(
+        (status = 200, description = "Events deleted or anonymized"),
+        (status = 400, description = "Invalid contract_id", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn delete_contract_events(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    validate_contract_id(&contract_id)?;
+
+    let anonymize_only = params
+        .get("anonymize_only")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false);
+
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("unknown");
+
+    if anonymize_only {
+        // Anonymize: set anonymized=true and hash tx_hash
+        use sha2::{Digest, Sha256};
+
+        let rows = sqlx::query("SELECT id, tx_hash FROM events WHERE contract_id = $1 AND anonymized = FALSE")
+            .bind(&contract_id)
+            .fetch_all(&state.pool)
+            .await?;
+
+        let count = rows.len() as u64;
+
+        for row in rows {
+            let id: Uuid = row.try_get("id")?;
+            let tx_hash: String = row.try_get("tx_hash")?;
+            let hashed_tx = {
+                let mut h = Sha256::new();
+                h.update(tx_hash.as_bytes());
+                format!("{:x}", h.finalize())
+            };
+
+            sqlx::query("UPDATE events SET anonymized = TRUE, event_data = $1, tx_hash = $2 WHERE id = $3")
+                .bind(json!({"anonymized": true}))
+                .bind(&hashed_tx)
+                .bind(id)
+                .execute(&state.pool)
+                .await?;
+        }
+
+        tracing::info!(
+            contract_id = %contract_id,
+            count = count,
+            client_ip = client_ip,
+            timestamp = %chrono::Utc::now(),
+            "Events anonymized for contract (GDPR)"
+        );
+
+        crate::metrics::record_events_deleted(count);
+
+        Ok(Json(json!({
+            "contract_id": contract_id,
+            "action": "anonymized",
+            "count": count,
+        })))
+    } else {
+        // Hard delete
+        let result = sqlx::query("DELETE FROM events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&state.pool)
+            .await?;
+
+        let count = result.rows_affected();
+
+        tracing::info!(
+            contract_id = %contract_id,
+            count = count,
+            client_ip = client_ip,
+            timestamp = %chrono::Utc::now(),
+            "Events deleted for contract (GDPR right-to-erasure)"
+        );
+
+        crate::metrics::record_events_deleted(count);
+
+        Ok(Json(json!({
+            "contract_id": contract_id,
+            "action": "deleted",
+            "count": count,
+        })))
+    }
+}
+
 /// Pause the indexer loop without stopping the HTTP server.
 #[utoipa::path(
     post,

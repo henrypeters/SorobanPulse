@@ -314,6 +314,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
         .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi))
         .route("/admin/events/{id}/anonymize", axum::routing::post(handlers::anonymize_event))
+        .route("/admin/events/contract/{contract_id}", axum::routing::delete(handlers::delete_contract_events))
         .route("/admin/indexer/pause", axum::routing::post(handlers::pause_indexer))
         .route("/admin/indexer/resume", axum::routing::post(handlers::resume_indexer))
         .route("/admin/contracts/{contract_id}/schema", axum::routing::post(handlers::register_contract_schema).get(handlers::get_contract_schema).delete(handlers::delete_contract_schema))
