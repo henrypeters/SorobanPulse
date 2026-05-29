@@ -129,9 +129,31 @@ All canonical routes are versioned under `/v1/`. The unversioned paths (`/events
 Returns paginated events across all contracts.
 
 - **`exact_count`**: (Optional) Use `true` for a precise `COUNT(*)` result on a large dataset. Default is `false`, which provides an approximate count via PostgreSQL statistics for low-latency responses.
-- **`event_type`**: (Optional) Filter by event type. Accepted values: `contract`, `diagnostic`, `system`. Returns `400` for unknown values.
+- **`event_type`**: (Optional) Filter by event type. Accepted values: `contract`, `diagnostic`, `system` (case-insensitive). Returns `400` for unknown values.
 - **`from_ledger`**: (Optional) Return only events at or after this ledger sequence number.
 - **`to_ledger`**: (Optional) Return only events at or before this ledger sequence number. Returns `400` if `from_ledger > to_ledger`.
+
+#### NDJSON (newline-delimited JSON)
+
+Send `Accept: application/x-ndjson` to receive one JSON object per line instead of a wrapped array. This allows streaming processing — consumers can start handling events before the full response is received.
+
+```bash
+# NDJSON — each line is a complete JSON event object
+curl -H "Accept: application/x-ndjson" http://localhost:3000/v1/events
+
+# Export as NDJSON (requires API key)
+curl -H "Accept: application/x-ndjson" \
+     -H "Authorization: Bearer $API_KEY" \
+     http://localhost:3000/v1/events/export
+```
+
+Example NDJSON output:
+```
+{"id":"uuid1","contract_id":"CABC...","event_type":"contract","ledger":1234567,...}
+{"id":"uuid2","contract_id":"CABC...","event_type":"contract","ledger":1234568,...}
+```
+
+Default JSON response:
 
 ```json
 {
