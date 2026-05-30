@@ -5,6 +5,44 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
+/// Notification format for webhooks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationFormat {
+    Raw,
+    Slack,
+    Discord,
+    Teams,
+    Pagerduty,
+}
+
+impl fmt::Display for NotificationFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotificationFormat::Raw => write!(f, "raw"),
+            NotificationFormat::Slack => write!(f, "slack"),
+            NotificationFormat::Discord => write!(f, "discord"),
+            NotificationFormat::Teams => write!(f, "teams"),
+            NotificationFormat::Pagerduty => write!(f, "pagerduty"),
+        }
+    }
+}
+
+impl FromStr for NotificationFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "raw" => Ok(NotificationFormat::Raw),
+            "slack" => Ok(NotificationFormat::Slack),
+            "discord" => Ok(NotificationFormat::Discord),
+            "teams" => Ok(NotificationFormat::Teams),
+            "pagerduty" => Ok(NotificationFormat::Pagerduty),
+            other => Err(format!("unknown notification format: {other}")),
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
 )]
@@ -108,6 +146,16 @@ pub struct PaginationParams {
     pub to_timestamp: Option<String>,
     /// Return event_data as base64-encoded gzip-compressed JSON (default: false).
     pub compact: Option<bool>,
+    /// Comma-separated list of contract IDs to exclude from results.
+    pub exclude_contract_ids: Option<String>,
+    /// Comma-separated list of event types to exclude from results.
+    pub exclude_event_types: Option<String>,
+    /// Latitude for geospatial filtering (requires near_lon and radius_km).
+    pub near_lat: Option<f64>,
+    /// Longitude for geospatial filtering (requires near_lat and radius_km).
+    pub near_lon: Option<f64>,
+    /// Radius in kilometers for geospatial filtering (requires near_lat and near_lon).
+    pub radius_km: Option<f64>,
 }
 
 /// Sort order for event list endpoints.
@@ -279,6 +327,49 @@ pub struct TimeseriesResponse {
     pub data: Vec<TimeseriesBucket>,
 }
 
+/// Webhook configuration for formatted notifications
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct WebhookConfig {
+    pub id: Uuid,
+    pub url: String,
+    pub secret: Option<String>,
+    pub notification_format: NotificationFormat,
+    pub message_template: Option<String>,
+    pub contract_filter: Option<Vec<String>>,
+    pub event_type_filter: Option<Vec<String>>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// PagerDuty configuration for incident management
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct PagerDutyConfig {
+    pub id: Uuid,
+    pub routing_key: String,
+    pub service_name: String,
+    pub contract_filter: Option<Vec<String>>,
+    pub event_type_filter: Option<Vec<String>>,
+    pub severity_mapping: Value,
+    pub auto_resolve: bool,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// PagerDuty incident tracking
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct PagerDutyIncident {
+    pub id: Uuid,
+    pub dedup_key: String,
+    pub contract_id: String,
+    pub event_type: String,
+    pub incident_key: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
 /// Query parameters for GET /v1/events/diff
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct DiffParams {
@@ -442,6 +533,59 @@ impl PaginationParams {
 
     pub fn limit(&self) -> i64 {
         self.limit.unwrap_or(20).clamp(1, 100)
+    }
+
+    /// Validate geospatial parameters
+    pub fn validate_geospatial(&self) -> Result<(), String> {
+        let has_lat = self.near_lat.is_some();
+        let has_lon = self.near_lon.is_some();
+        let has_radius = self.radius_km.is_some();
+
+        // All three must be provided together or none at all
+        if has_lat || has_lon || has_radius {
+            if !has_lat || !has_lon || !has_radius {
+                return Err("near_lat, near_lon, and radius_km must all be provided together".to_string());
+            }
+
+            let lat = self.near_lat.unwrap();
+            let lon = self.near_lon.unwrap();
+            let radius = self.radius_km.unwrap();
+
+            // Validate latitude range
+            if lat < -90.0 || lat > 90.0 {
+                return Err("near_lat must be between -90 and 90".to_string());
+            }
+
+            // Validate longitude range
+            if lon < -180.0 || lon > 180.0 {
+                return Err("near_lon must be between -180 and 180".to_string());
+            }
+
+            // Validate radius
+            if radius <= 0.0 || radius > 20000.0 {
+                return Err("radius_km must be between 0 and 20000".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate exclusion parameters
+    pub fn validate_exclusions(&self) -> Result<(), String> {
+        // Cannot specify both include and exclude for the same parameter
+        if self.contract_id.is_some() && self.exclude_contract_ids.is_some() {
+            return Err("cannot specify both contract_id and exclude_contract_ids".to_string());
+        }
+
+        if self.contract_ids.is_some() && self.exclude_contract_ids.is_some() {
+            return Err("cannot specify both contract_ids and exclude_contract_ids".to_string());
+        }
+
+        if self.event_type.is_some() && self.exclude_event_types.is_some() {
+            return Err("cannot specify both event_type and exclude_event_types".to_string());
+        }
+
+        Ok(())
     }
 }
 

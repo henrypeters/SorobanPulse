@@ -142,6 +142,11 @@ pub fn record_webhook_failure() {
     m::counter!("soroban_pulse_webhook_failures_total").increment(1);
 }
 
+/// Record a PagerDuty delivery failure (all retries exhausted)
+pub fn record_pagerduty_failure() {
+    m::counter!("soroban_pulse_pagerduty_failures_total").increment(1);
+}
+
 /// Record a Redis queue publish failure (all retries exhausted)
 pub fn record_queue_publish_failure() {
     m::counter!("soroban_pulse_redis_publish_failures_total").increment(1);

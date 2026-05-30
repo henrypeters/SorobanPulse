@@ -274,6 +274,22 @@ pub struct Config {
     pub event_transform_script: Option<String>,
     /// Execution timeout for Lua scripts in milliseconds (default: 100).
     pub event_transform_timeout_ms: u64,
+    
+    // Webhook notification formatting
+    pub webhook_notification_format: String,
+    pub webhook_message_template: Option<String>,
+    
+    // PagerDuty configuration (Issue #472)
+    pub pagerduty_routing_key: Option<String>,
+    pub pagerduty_service_name: String,
+    pub pagerduty_contract_filter: Vec<String>,
+    pub pagerduty_event_type_filter: Vec<String>,
+    pub pagerduty_severity_mapping: std::collections::HashMap<String, String>,
+    pub pagerduty_auto_resolve: bool,
+    pub pagerduty_auto_resolve_threshold_minutes: i64,
+    
+    // Stats cache TTL
+    pub stats_cache_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -356,6 +372,22 @@ impl Default for Config {
             slow_query_threshold_ms: 1000,
             event_transform_script: None,
             event_transform_timeout_ms: 100,
+            webhook_notification_format: "raw".to_string(),
+            webhook_message_template: None,
+            pagerduty_routing_key: None,
+            pagerduty_service_name: "Soroban Pulse".to_string(),
+            pagerduty_contract_filter: Vec::new(),
+            pagerduty_event_type_filter: Vec::new(),
+            pagerduty_severity_mapping: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("contract".to_string(), "error".to_string());
+                map.insert("diagnostic".to_string(), "warning".to_string());
+                map.insert("system".to_string(), "info".to_string());
+                map
+            },
+            pagerduty_auto_resolve: true,
+            pagerduty_auto_resolve_threshold_minutes: 30,
+            stats_cache_ttl_secs: 30,
         }
     }
 }
@@ -1157,6 +1189,46 @@ impl Config {
                 &mut errors,
             )
             .unwrap_or(100),
+            webhook_notification_format: env_or_file("WEBHOOK_NOTIFICATION_FORMAT", &file)
+                .unwrap_or_else(|| "raw".to_string()),
+            webhook_message_template: env_or_file("WEBHOOK_MESSAGE_TEMPLATE", &file),
+            pagerduty_routing_key: env_or_file("PAGERDUTY_ROUTING_KEY", &file),
+            pagerduty_service_name: env_or_file("PAGERDUTY_SERVICE_NAME", &file)
+                .unwrap_or_else(|| "Soroban Pulse".to_string()),
+            pagerduty_contract_filter: env_or_file("PAGERDUTY_CONTRACT_FILTER", &file)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            pagerduty_event_type_filter: env_or_file("PAGERDUTY_EVENT_TYPE_FILTER", &file)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            pagerduty_severity_mapping: env_or_file("PAGERDUTY_SEVERITY_MAPPING", &file)
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_else(|| {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("contract".to_string(), "error".to_string());
+                    map.insert("diagnostic".to_string(), "warning".to_string());
+                    map.insert("system".to_string(), "info".to_string());
+                    map
+                }),
+            pagerduty_auto_resolve: env_or_file("PAGERDUTY_AUTO_RESOLVE", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or(true),
+            pagerduty_auto_resolve_threshold_minutes: env_or_file("PAGERDUTY_AUTO_RESOLVE_THRESHOLD_MINUTES", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            stats_cache_ttl_secs: env_or_file("STATS_CACHE_TTL_SECS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
         }
     }
 }

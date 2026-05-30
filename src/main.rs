@@ -36,6 +36,8 @@ mod schema_validator;
 mod stats_refresh;
 mod subscriptions;
 mod webhook;
+mod notification_formatter;
+mod pagerduty;
 mod xdr_validation;
 
 #[cfg(feature = "archive")]
