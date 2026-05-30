@@ -152,6 +152,17 @@
           }
           ,
           {
+            "name": "ledger_hash",
+            "in": "query",
+            "description": "Filter events by ledger hash",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+          ,
+          {
             "name": "sort",
             "in": "query",
             "description": "Sort order: asc (oldest first) or desc (newest first, default)",

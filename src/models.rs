@@ -78,6 +78,7 @@ pub struct PaginationParams {
     pub event_type: Option<EventType>,
     pub from_ledger: Option<i64>,
     pub to_ledger: Option<i64>,
+    pub ledger_hash: Option<String>,
     pub cursor: Option<String>,
     pub sort: Option<SortOrder>,
     /// Sort column: `ledger`, `timestamp`, or `created_at` (default: ledger)
@@ -499,13 +500,22 @@ mod tests {
             exact_count: None,
             fields: None,
             contract_id: None,
+            contract_ids: None,
             event_type: None,
             from_ledger: None,
             to_ledger: None,
+            ledger_hash: None,
             cursor: None,
             sort: None,
+            sort_by: None,
             in_successful_call: None,
-            contract_id: None,
+            schema_version: None,
+            topic_sym: None,
+            topic: None,
+            search: None,
+            from_timestamp: None,
+            to_timestamp: None,
+            compact: None,
         }
     }
 

@@ -1295,6 +1295,7 @@ fn ndjson_response(events: impl Iterator<Item = Value>) -> Response<Body> {
         ("event_type" = Option<crate::models::EventType>, Query, description = "Filter by event type: contract, diagnostic, system"),
         ("from_ledger" = Option<i64>, Query, description = "Return events at or after this ledger"),
         ("to_ledger" = Option<i64>, Query, description = "Return events at or before this ledger"),
+        ("ledger_hash" = Option<String>, Query, description = "Filter by ledger hash"),
         ("from_timestamp" = Option<String>, Query, description = "Return events at or after this timestamp (ISO 8601 format, e.g., 2026-03-14T00:00:00Z)"),
         ("to_timestamp" = Option<String>, Query, description = "Return events at or before this timestamp (ISO 8601 format, e.g., 2026-03-14T00:00:00Z)"),
         ("sort" = Option<String>, Query, description = "Sort order: asc (oldest first) or desc (newest first, default)"),
@@ -1440,6 +1441,10 @@ pub async fn get_events(
             conditions.push(format!("ledger <= ${bind_idx}"));
             bind_idx += 1;
         }
+        if params.ledger_hash.is_some() {
+            conditions.push(format!("ledger_hash = ${bind_idx}"));
+            bind_idx += 1;
+        }
         if params.in_successful_call.is_some() {
             conditions.push(format!("in_successful_call = ${bind_idx}"));
             bind_idx += 1;
@@ -1535,6 +1540,9 @@ pub async fn get_events(
         }
         if let Some(tl) = params.to_ledger {
             q = q.bind(tl);
+        }
+        if let Some(ref hash) = params.ledger_hash {
+            q = q.bind(hash);
         }
         if let Some(isc) = params.in_successful_call {
             q = q.bind(isc);
@@ -1688,6 +1696,10 @@ pub async fn get_events(
         conditions.push(format!("ledger <= ${bind_idx}"));
         bind_idx += 1;
     }
+    if params.ledger_hash.is_some() {
+        conditions.push(format!("ledger_hash = ${bind_idx}"));
+        bind_idx += 1;
+    }
     if params.in_successful_call.is_some() {
         conditions.push(format!("in_successful_call = ${bind_idx}"));
         bind_idx += 1;
@@ -1773,6 +1785,9 @@ pub async fn get_events(
     }
     if let Some(tl) = params.to_ledger {
         q = q.bind(tl);
+    }
+    if let Some(ref hash) = params.ledger_hash {
+        q = q.bind(hash);
     }
     if let Some(isc) = params.in_successful_call {
         q = q.bind(isc);
@@ -5266,6 +5281,59 @@ mod tests {
         assert_eq!(v["data"].as_array().unwrap().len(), 4); // Contract events with ledger 0-6
         assert_eq!(v["total"], 4);
         assert_eq!(v["approximate"], false);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_events_filter_by_ledger_hash(pool: PgPool) {
+        let app = create_test_router(pool.clone());
+
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012345")
+        .bind("contract")
+        .bind("a".repeat(64))
+        .bind(100_i64)
+        .bind(Utc::now())
+        .bind(json!({"test": "one"}))
+        .bind("abc123")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind("C1234567890123456789012345678901234567890123456789012346")
+        .bind("contract")
+        .bind("b".repeat(64))
+        .bind(101_i64)
+        .bind(Utc::now())
+        .bind(json!({"test": "two"}))
+        .bind("def456")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events?ledger_hash=abc123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["ledger_hash"], json!("abc123"));
+        assert_eq!(data[0]["tx_hash"], json!("a".repeat(64)));
     }
 
     #[sqlx::test(migrations = "./migrations")]

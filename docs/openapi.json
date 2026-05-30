@@ -151,6 +151,16 @@
             }
           },
           {
+            "name": "ledger_hash",
+            "in": "query",
+            "description": "Filter events by ledger hash",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
             "name": "from_timestamp",
             "in": "query",
             "description": "Return events at or after this timestamp (ISO 8601 format, e.g., 2026-03-14T00:00:00Z)",
