@@ -96,7 +96,23 @@ pub async fn deliver_with_retry_policy(
     }).await;
 
     match result {
-        Ok(()) => return, // Success
+        Ok(()) => {
+            // Record a delivery receipt (Issue #475).
+            if let Some(pool) = pool {
+                let event_id =
+                    crate::notification_delivery::resolve_event_id(pool, &event).await;
+                crate::notification_delivery::record_delivery(
+                    pool,
+                    "webhook",
+                    None,
+                    event_id,
+                    crate::notification_delivery::DeliveryStatus::Success,
+                    None,
+                )
+                .await;
+            }
+            return; // Success
+        }
         Err(error_msg) => {
             error!(
                 url = %url,
@@ -105,7 +121,22 @@ pub async fn deliver_with_retry_policy(
                 max_attempts = retry_policy.max_attempts,
                 "Webhook delivery failed after all retries"
             );
-    
+
+            // Record a failed delivery receipt (Issue #475).
+            if let Some(pool) = pool {
+                let event_id =
+                    crate::notification_delivery::resolve_event_id(pool, &event).await;
+                crate::notification_delivery::record_delivery(
+                    pool,
+                    "webhook",
+                    None,
+                    event_id,
+                    crate::notification_delivery::DeliveryStatus::Failure,
+                    Some(&error_msg),
+                )
+                .await;
+            }
+
             // Insert into DLQ if pool is available
             if let Some(pool) = pool {
                 let payload = serde_json::to_value(&event).unwrap_or(serde_json::json!({}));

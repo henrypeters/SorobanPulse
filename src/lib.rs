@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod models;
 pub mod normalizer;
+pub mod notification_delivery;
 pub mod pruner;
 pub mod pubsub;
 pub mod queue_publisher;

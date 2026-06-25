@@ -9894,6 +9894,47 @@ pub async fn get_mask_job_status(
     }))
 }
 
+/// Query parameters for the notification delivery history endpoint (Issue #475).
+#[derive(Debug, serde::Deserialize)]
+pub struct DeliveriesQuery {
+    /// Filter by channel type (e.g. `webhook`, `email`).
+    pub channel_type: Option<String>,
+    /// Filter by delivery status (`success` or `failure`).
+    pub status: Option<String>,
+    /// Maximum number of receipts to return (default 100, max 1000).
+    pub limit: Option<i64>,
+}
+
+/// GET /v1/admin/notifications/deliveries — return notification delivery history
+/// with status, so operators can audit delivery for compliance (Issue #475).
+pub async fn get_notification_deliveries(
+    State(state): State<AppState>,
+    Query(params): Query<DeliveriesQuery>,
+) -> Result<Json<Value>, AppError> {
+    if let Some(ref status) = params.status {
+        if status != "success" && status != "failure" {
+            return Err(AppError::Validation(
+                "status must be 'success' or 'failure'".to_string(),
+            ));
+        }
+    }
+
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+
+    let receipts = crate::notification_delivery::query_deliveries(
+        &state.pool,
+        params.channel_type.as_deref(),
+        params.status.as_deref(),
+        limit,
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "count": receipts.len(),
+        "deliveries": receipts,
+    })))
+}
+
 async fn mask_events_background(
     pool: &sqlx::PgPool,
     contract_ids: Option<Vec<String>>,

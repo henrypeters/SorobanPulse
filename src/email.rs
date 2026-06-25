@@ -183,12 +183,42 @@ impl EmailNotifier {
         if let Err(e) = self.send_email(&subject, &body).await {
             error!(error = %e, "Failed to send email notification");
             metrics::record_email_failure();
+            self.record_delivery_receipts(events, false, Some(&e.to_string()))
+                .await;
         } else {
             info!(
                 recipients = self.to.len(),
                 event_count = events.len(),
                 "Email notification sent successfully"
             );
+            self.record_delivery_receipts(events, true, None).await;
+        }
+    }
+
+    /// Record a delivery receipt for each event in a batch (Issue #475).
+    async fn record_delivery_receipts(
+        &self,
+        events: &[SorobanEvent],
+        success: bool,
+        error: Option<&str>,
+    ) {
+        let status = if success {
+            crate::notification_delivery::DeliveryStatus::Success
+        } else {
+            crate::notification_delivery::DeliveryStatus::Failure
+        };
+        for event in events {
+            let event_id =
+                crate::notification_delivery::resolve_event_id(&self.pool, event).await;
+            crate::notification_delivery::record_delivery(
+                &self.pool,
+                "email",
+                None,
+                event_id,
+                status,
+                error,
+            )
+            .await;
         }
     }
 
