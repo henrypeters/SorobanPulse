@@ -68,6 +68,8 @@ pub struct AppState {
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
     /// Per-IP SSE connection counts (Issue #453)
     pub sse_connections_per_ip: Arc<DashMap<String, usize>>,
+    /// SHA-256 hex of SUPER_ADMIN_API_KEY, grants unrestricted channel access (#508).
+    pub super_admin_key_hash: Option<String>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -292,6 +294,11 @@ pub fn create_router_with_tx_and_tenant_map(
         .max_capacity(1)
         .time_to_live(std::time::Duration::from_secs(config.stats_cache_ttl_secs))
         .build();
+    let super_admin_key_hash = std::env::var("SUPER_ADMIN_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|k| crate::middleware::hash_api_key(&k));
+
     let app_state = AppState {
         pool,
         read_pool,
@@ -312,6 +319,7 @@ pub fn create_router_with_tx_and_tenant_map(
         stats_cache,
         shutdown_rx,
         sse_connections_per_ip: Arc::new(DashMap::new()),
+        super_admin_key_hash,
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
@@ -401,7 +409,25 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/contracts/{contract_id}/validate", axum::routing::post(handlers::validate_event_data_against_schema))
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
-        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription));
+        .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
+        // #507 #508 #509 #510 Notification channel management
+        .route("/admin/notifications/channels",
+            get(handlers::list_notification_channels)
+            .post(handlers::create_notification_channel))
+        .route("/admin/notifications/channels/{id}",
+            get(handlers::get_notification_channel)
+            .put(handlers::update_notification_channel)
+            .delete(handlers::delete_notification_channel))
+        .route("/admin/notifications/channels/{id}/tags",
+            axum::routing::post(handlers::add_channel_tag))
+        .route("/admin/notifications/channels/{id}/tags/{tag}",
+            axum::routing::delete(handlers::remove_channel_tag))
+        // #507 Channel groups
+        .route("/admin/notifications/groups",
+            get(handlers::list_channel_groups)
+            .post(handlers::create_channel_group))
+        .route("/admin/notifications/groups/{id}",
+            axum::routing::delete(handlers::delete_channel_group));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
