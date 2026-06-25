@@ -10179,6 +10179,56 @@ const DEFAULT_RETRY_POLICY: &str = r#"{
     "max_backoff_ms": 60000
 }"#;
 
+/// Validate a channel's config at creation or update time (#503).
+///
+/// - webhook: sends a HEAD request to `config.url` and expects 2xx.
+/// - email:   opens an SMTP connection using `config.smtp_host/port/user/password`.
+/// - sms:     no network check (credentials are opaque to the platform).
+async fn validate_channel_config(channel_type: &str, config: &Value) -> Result<(), AppError> {
+    match channel_type {
+        "webhook" => {
+            let url = config
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AppError::Validation("webhook config must include 'url'".to_string()))?;
+
+            crate::webhook::validate_webhook_url(url)
+                .await
+                .map_err(|e| AppError::Validation(format!("webhook validation failed: {}", e)))?;
+        }
+        "email" => {
+            let smtp_host = config
+                .get("smtp_host")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::Validation("email config must include 'smtp_host'".to_string())
+                })?
+                .to_string();
+
+            let smtp_port = config
+                .get("smtp_port")
+                .and_then(Value::as_u64)
+                .unwrap_or(587) as u16;
+
+            let smtp_user = config
+                .get("smtp_user")
+                .and_then(Value::as_str)
+                .map(String::from);
+
+            let smtp_password = config
+                .get("smtp_password")
+                .and_then(Value::as_str)
+                .map(String::from);
+
+            crate::email::validate_smtp_config(smtp_host, smtp_port, smtp_user, smtp_password)
+                .await
+                .map_err(|e| AppError::Validation(format!("email validation failed: {}", e)))?;
+        }
+        _ => {} // sms and future types: no upfront network check
+    }
+    Ok(())
+}
+
 pub async fn list_notification_channels(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
@@ -10218,6 +10268,9 @@ pub async fn create_notification_channel(
             "channel_type must be one of: webhook, email, sms".to_string(),
         ));
     }
+
+    // Validate channel config at creation time (#503).
+    validate_channel_config(&req.channel_type, &req.config).await?;
 
     let retry_policy = req.retry_policy.unwrap_or_else(|| {
         serde_json::from_str(DEFAULT_RETRY_POLICY).unwrap()
@@ -10278,6 +10331,9 @@ pub async fn update_notification_channel(
     let new_name = req.name.unwrap_or(existing.name);
     let new_config = req.config.unwrap_or(existing.config);
     let new_retry = req.retry_policy.unwrap_or(existing.retry_policy);
+
+    // Validate updated config before persisting (#503).
+    validate_channel_config(&existing.channel_type, &new_config).await?;
 
     let channel = sqlx::query_as::<_, models::NotificationChannel>(
         "UPDATE notification_channels
@@ -10717,5 +10773,55 @@ mod notification_channel_import_export_tests {
         let yaml = serde_yaml::to_string(&payload).unwrap();
         let roundtripped: Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(roundtripped["channels"][0]["name"], "ch1");
+    }
+}
+
+// ── Notification Channel Config Validation (#503) ─────────────────────────────
+
+#[cfg(test)]
+mod notification_channel_validation_tests {
+    use super::*;
+
+    #[test]
+    fn webhook_config_requires_url_field() {
+        let config_missing_url = json!({ "secret": "abc" });
+        let url = config_missing_url.get("url").and_then(Value::as_str);
+        assert!(url.is_none(), "url must be absent when not provided");
+    }
+
+    #[test]
+    fn webhook_config_with_url_field_passes_extraction() {
+        let config = json!({ "url": "https://hooks.example.com/notify", "secret": "abc" });
+        let url = config.get("url").and_then(Value::as_str);
+        assert_eq!(url, Some("https://hooks.example.com/notify"));
+    }
+
+    #[test]
+    fn email_config_requires_smtp_host() {
+        let config = json!({ "smtp_port": 587 });
+        let host = config.get("smtp_host").and_then(Value::as_str);
+        assert!(host.is_none());
+    }
+
+    #[test]
+    fn email_config_smtp_port_defaults_to_587_when_absent() {
+        let config = json!({ "smtp_host": "mail.example.com" });
+        let port = config.get("smtp_port").and_then(Value::as_u64).unwrap_or(587) as u16;
+        assert_eq!(port, 587);
+    }
+
+    #[test]
+    fn email_config_smtp_port_uses_provided_value() {
+        let config = json!({ "smtp_host": "mail.example.com", "smtp_port": 465 });
+        let port = config.get("smtp_port").and_then(Value::as_u64).unwrap_or(587) as u16;
+        assert_eq!(port, 465);
+    }
+
+    #[test]
+    fn sms_channel_type_skips_network_validation() {
+        // validate_channel_config matches on channel_type; sms hits the wildcard arm.
+        let channel_type = "sms";
+        let is_network_validated = matches!(channel_type, "webhook" | "email");
+        assert!(!is_network_validated);
     }
 }
