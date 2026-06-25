@@ -10513,3 +10513,209 @@ mod notification_channel_versioning_tests {
         assert_eq!(rolled_back, "Old Name");
     }
 }
+
+// ── Notification Channel Import / Export (#504) ───────────────────────────────
+
+/// Recursively replace values whose key matches a known secret field name with
+/// the placeholder string so that exported configs are safe to share.
+fn redact_secrets(value: Value) -> Value {
+    const SECRET_KEYS: &[&str] = &[
+        "secret", "password", "api_key", "token", "credential", "auth",
+    ];
+    match value {
+        Value::Object(mut map) => {
+            for (k, v) in map.iter_mut() {
+                let k_lower = k.to_lowercase();
+                if SECRET_KEYS.iter().any(|s| k_lower.contains(s)) {
+                    *v = Value::String("***REDACTED***".to_string());
+                } else {
+                    *v = redact_secrets(v.clone());
+                }
+            }
+            Value::Object(map)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(redact_secrets).collect()),
+        other => other,
+    }
+}
+
+/// GET /v1/admin/notifications/channels/export?format=json|yaml
+///
+/// Returns all channel configurations. Secret-looking fields are redacted.
+pub async fn export_notification_channels(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    let channels = sqlx::query_as::<_, models::NotificationChannel>(
+        "SELECT id, name, channel_type, config, retry_policy, created_at, updated_at
+         FROM notification_channels ORDER BY created_at ASC",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let redacted: Vec<Value> = channels
+        .into_iter()
+        .map(|ch| {
+            json!({
+                "name":         ch.name,
+                "channel_type": ch.channel_type,
+                "config":       redact_secrets(ch.config),
+                "retry_policy": ch.retry_policy,
+            })
+        })
+        .collect();
+
+    let payload = json!({ "channels": redacted });
+
+    let format = params.get("format").map(|s| s.as_str()).unwrap_or("json");
+
+    match format {
+        "yaml" => {
+            let yaml_str = serde_yaml::to_string(&payload)
+                .map_err(|e| AppError::Internal(format!("YAML serialization failed: {}", e)))?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/x-yaml")
+                .body(Body::from(yaml_str))
+                .unwrap()
+                .into_response())
+        }
+        _ => Ok((StatusCode::OK, Json(payload)).into_response()),
+    }
+}
+
+/// POST /v1/admin/notifications/channels/import
+///
+/// Accepts a JSON or YAML body containing a `channels` array and creates each
+/// channel. Secrets must be supplied by the caller (they are redacted on export).
+pub async fn import_notification_channels(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+
+    let req: models::ImportChannelsRequest = if content_type.contains("yaml") {
+        serde_yaml::from_slice(&body)
+            .map_err(|e| AppError::Validation(format!("invalid YAML: {}", e)))?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::Validation(format!("invalid JSON: {}", e)))?
+    };
+
+    if req.channels.is_empty() {
+        return Err(AppError::Validation(
+            "channels array must not be empty".to_string(),
+        ));
+    }
+
+    let default_retry: Value = serde_json::from_str(DEFAULT_RETRY_POLICY).unwrap();
+
+    let mut created = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+
+    for entry in req.channels {
+        if !VALID_CHANNEL_TYPES.contains(&entry.channel_type.as_str()) {
+            errors.push(format!(
+                "channel '{}': invalid channel_type '{}'",
+                entry.name, entry.channel_type
+            ));
+            continue;
+        }
+
+        let retry = entry.retry_policy.unwrap_or_else(|| default_retry.clone());
+
+        match sqlx::query(
+            "INSERT INTO notification_channels (name, channel_type, config, retry_policy)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(&entry.name)
+        .bind(&entry.channel_type)
+        .bind(&entry.config)
+        .bind(&retry)
+        .execute(&state.pool)
+        .await
+        {
+            Ok(r) if r.rows_affected() > 0 => created += 1,
+            Ok(_) => errors.push(format!("channel '{}': name already exists, skipped", entry.name)),
+            Err(e) => errors.push(format!("channel '{}': {}", entry.name, e)),
+        }
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "created": created, "errors": errors })),
+    ))
+}
+
+#[cfg(test)]
+mod notification_channel_import_export_tests {
+    use super::*;
+
+    #[test]
+    fn redact_secrets_replaces_secret_field() {
+        let config = json!({ "url": "https://example.com", "secret": "s3cr3t" });
+        let redacted = redact_secrets(config);
+        assert_eq!(redacted["secret"], "***REDACTED***");
+        assert_eq!(redacted["url"], "https://example.com");
+    }
+
+    #[test]
+    fn redact_secrets_replaces_password_field() {
+        let config = json!({ "smtp_host": "mail.example.com", "smtp_password": "hunter2" });
+        let redacted = redact_secrets(config);
+        assert_eq!(redacted["smtp_password"], "***REDACTED***");
+        assert_eq!(redacted["smtp_host"], "mail.example.com");
+    }
+
+    #[test]
+    fn redact_secrets_replaces_api_key_field() {
+        let config = json!({ "api_key": "abc123", "endpoint": "https://api.example.com" });
+        let redacted = redact_secrets(config);
+        assert_eq!(redacted["api_key"], "***REDACTED***");
+        assert_eq!(redacted["endpoint"], "https://api.example.com");
+    }
+
+    #[test]
+    fn redact_secrets_leaves_non_secret_fields_intact() {
+        let config = json!({ "url": "https://example.com", "retries": 3 });
+        let redacted = redact_secrets(config);
+        assert_eq!(redacted["url"], "https://example.com");
+        assert_eq!(redacted["retries"], 3);
+    }
+
+    #[test]
+    fn export_import_roundtrip_preserves_non_secret_fields() {
+        let original = json!({
+            "name": "Test Webhook",
+            "channel_type": "webhook",
+            "config": { "url": "https://example.com/hook", "secret": "topsecret" },
+            "retry_policy": { "max_attempts": 3 }
+        });
+
+        // Simulate export (redact secrets).
+        let exported = json!({
+            "name": original["name"].clone(),
+            "channel_type": original["channel_type"].clone(),
+            "config": redact_secrets(original["config"].clone()),
+            "retry_policy": original["retry_policy"].clone(),
+        });
+
+        assert_eq!(exported["name"], "Test Webhook");
+        assert_eq!(exported["channel_type"], "webhook");
+        assert_eq!(exported["config"]["url"], "https://example.com/hook");
+        assert_eq!(exported["config"]["secret"], "***REDACTED***");
+    }
+
+    #[test]
+    fn yaml_and_json_represent_same_structure() {
+        let payload = json!({ "channels": [{ "name": "ch1", "channel_type": "webhook" }] });
+        let yaml = serde_yaml::to_string(&payload).unwrap();
+        let roundtripped: Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(roundtripped["channels"][0]["name"], "ch1");
+    }
+}

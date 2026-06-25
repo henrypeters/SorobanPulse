@@ -402,6 +402,15 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/subscriptions", axum::routing::post(subscriptions::create_subscription))
         .route("/subscriptions/{id}", get(subscriptions::get_subscription).delete(subscriptions::cancel_subscription))
         .route("/subscriptions/{id}/ack", axum::routing::post(subscriptions::ack_subscription))
+        // Notification channel import/export (#504) — static paths first
+        .route(
+            "/admin/notifications/channels/export",
+            get(handlers::export_notification_channels),
+        )
+        .route(
+            "/admin/notifications/channels/import",
+            axum::routing::post(handlers::import_notification_channels),
+        )
         // Notification channel CRUD + clone (#506)
         .route(
             "/admin/notifications/channels",
