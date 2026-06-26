@@ -9,6 +9,20 @@ A lightweight Rust backend service that indexes Soroban smart contract events on
 - **PostgreSQL** + **SQLx** (database + migrations)
 - **Stellar Soroban RPC** (event source)
 
+## Architecture
+
+For a comprehensive understanding of the system architecture, including component interactions, event flow, and deployment patterns, see [docs/architecture.md](docs/architecture.md).
+
+The system follows this high-level flow:
+- **Stellar RPC** → **Indexer** → **PostgreSQL** → **REST API/SSE** → **Clients**
+
+Key features:
+- Multi-replica advisory lock mechanism for safe concurrent indexing
+- Real-time event streaming via Server-Sent Events (SSE)
+- Webhook delivery with retry logic and HMAC signature verification
+- Property-based and mutation testing for quality assurance
+- API contract testing for client-server compatibility
+
 ## Project Structure
 
 ```
