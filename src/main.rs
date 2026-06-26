@@ -22,6 +22,7 @@ mod metrics;
 mod middleware;
 mod models;
 mod normalizer;
+mod notification_dedup;
 
 #[cfg(feature = "parquet")]
 mod parquet_export;
