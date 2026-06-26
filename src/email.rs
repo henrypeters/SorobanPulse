@@ -367,9 +367,19 @@ impl EmailNotifier {
             message_builder = message_builder.header(ListUnsubscribe(format!("<{url}>")));
         }
 
-        let message = message_builder
+        let mut message = message_builder
             .header(header::ContentType::TEXT_PLAIN)
             .body(body.to_string())?;
+
+        // DKIM-sign the message when a signing key is configured (Issue #485).
+        // A bad key never blocks delivery — it is logged and the email is sent
+        // unsigned (the key is validated at startup, so this is defensive).
+        if let (Some(selector), Some(key)) = (&self.dkim_selector, &self.dkim_private_key) {
+            match build_dkim_config(selector, &self.from, key.expose_secret()) {
+                Ok(config) => message.sign(&config),
+                Err(e) => warn!(error = %e, "DKIM signing skipped"),
+            }
+        }
 
         // Build SMTP transport
         let mut transport_builder = SmtpTransport::relay(&self.smtp_host)?.port(self.smtp_port);
