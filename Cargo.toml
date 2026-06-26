@@ -103,6 +103,7 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chron
 async-trait = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+pact = "1"
 
 [dependencies.flate2]
 version = "1"

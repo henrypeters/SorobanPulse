@@ -119,17 +119,27 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full developer workflow.
 
 ### Testing & Quality Assurance
 
-The project employs multiple testing strategies:
+The project employs a comprehensive testing strategy across multiple dimensions:
 
 - **Unit & Integration Tests**: Standard test suite (`make test`)
 - **Property-Based Tests**: Discover edge cases with `proptest` — see [docs/property-testing.md](docs/property-testing.md)
 - **Mutation Testing**: Evaluate test coverage quality with `cargo-mutants` — see [docs/mutation-testing.md](docs/mutation-testing.md)
-- **API Contract Tests**: Verify client-server compatibility with Pact — see [docs/contract-testing.md](docs/contract-testing.md)
+- **API Contract Tests**: Verify client-server API compatibility — see [docs/contract-testing.md](docs/contract-testing.md)
 
-Run mutation tests locally:
+Run tests locally:
 ```bash
+# Standard tests
+make test
+
+# Property-based tests (discover edge cases)
+PROPTEST_CASES=10000 cargo test --test property_tests
+
+# Mutation tests (evaluate test quality)
 cargo install cargo-mutants
 make -f Makefile.mutations mutants
+
+# Contract tests (verify API compatibility)
+cargo test --test contract_tests
 ```
 
 ## API
