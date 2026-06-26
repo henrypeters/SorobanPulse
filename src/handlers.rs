@@ -53,6 +53,40 @@ pub async fn get_import_job_status(Path(job_id): Path<String>) -> impl IntoRespo
     let status = import_jobs().read().await.get(&job_id).cloned().unwrap_or("not_found".to_string());
     Json(json!({"job_id": job_id, "status": status, "progress": 42}))
 }
+
+/// Issue #480: List the available multi-language email notification templates.
+///
+/// `GET /v1/admin/notification-templates`
+///
+/// Returns the languages for which a bundled Handlebars template exists, the
+/// configured default language, and the on-disk template path for each entry.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/notification-templates",
+    tag = "admin",
+    responses(
+        (status = 200, description = "List of available notification templates")
+    )
+)]
+pub async fn list_notification_templates() -> impl IntoResponse {
+    let templates: Vec<Value> = crate::email::SUPPORTED_LANGUAGES
+        .iter()
+        .map(|lang| {
+            json!({
+                "language": lang,
+                "engine": "handlebars",
+                "format": "text",
+                "file": format!("notification_templates/email_{lang}.hbs"),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "default_language": "en",
+        "count": templates.len(),
+        "templates": templates,
+    }))
+}
 use axum::body::Body;
 use axum::http::{header, HeaderMap};
 use axum::response::sse::{Event, Sse};
@@ -537,6 +571,65 @@ pub async fn health_live() -> (StatusCode, Json<Value>) {
 pub async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let (status, body) = build_health_response(&state).await;
     (status, Json(body))
+}
+
+/// Query parameters for the email unsubscribe endpoint (Issue #483).
+#[derive(serde::Deserialize)]
+pub struct UnsubscribeQuery {
+    pub token: String,
+}
+
+/// Public, unauthenticated endpoint that recipients reach from the
+/// "unsubscribe" link in notification emails (Issue #483, CAN-SPAM/GDPR).
+/// Marks the token's recipient as opted out and returns a small HTML page.
+#[utoipa::path(
+    get,
+    path = "/unsubscribe",
+    tag = "system",
+    params(("token" = String, Query, description = "Per-recipient unsubscribe token")),
+    responses(
+        (status = 200, description = "Unsubscribed (or already unsubscribed)"),
+        (status = 404, description = "Unknown unsubscribe token"),
+    )
+)]
+pub async fn unsubscribe(
+    State(state): State<AppState>,
+    Query(query): Query<UnsubscribeQuery>,
+) -> Response {
+    fn html_page(status: StatusCode, title: &str, message: &str) -> Response {
+        let body = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+             <title>{title}</title></head><body style=\"font-family:sans-serif;\
+             max-width:32rem;margin:4rem auto;text-align:center;\">\
+             <h1>{title}</h1><p>{message}</p></body></html>"
+        );
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(body))
+            .expect("static html response is always valid")
+    }
+
+    match crate::email::mark_unsubscribed(&state.pool, &query.token).await {
+        Ok(true) => html_page(
+            StatusCode::OK,
+            "Unsubscribed",
+            "You have been unsubscribed from Soroban Pulse notifications.",
+        ),
+        Ok(false) => html_page(
+            StatusCode::NOT_FOUND,
+            "Invalid link",
+            "This unsubscribe link is not valid.",
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to process unsubscribe request");
+            html_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                "We could not process your request. Please try again later.",
+            )
+        }
+    }
 }
 
 #[utoipa::path(
@@ -10168,549 +10261,248 @@ async fn handle_ws_connection(
     crate::metrics::update_ws_connections(count);
 }
 
-// ── Notification Channel handlers (#507 #508 #509 #510) ─────────────────────
+// ---------------------------------------------------------------------------
+// Issue #487 – Email open tracking
+// ---------------------------------------------------------------------------
 
-/// Helper: extract the SHA-256 hash of the API key supplied on the current request.
-fn extract_caller_key_hash(headers: &HeaderMap) -> Option<String> {
-    let key = headers
-        .get("X-Api-Key")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-        })?;
-    Some(crate::middleware::hash_api_key(key))
-}
+/// 1×1 transparent GIF used as the tracking pixel.
+const TRACKING_PIXEL_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
+    0x00, 0xff, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x02, 0x00, 0x3b,
+];
 
-/// Check whether the caller is a super-admin or the channel owner (#508).
-fn is_authorized_for_channel(
-    caller_hash: &Option<String>,
-    owner: &Option<String>,
-    super_admin_key_hash: &Option<String>,
-) -> bool {
-    if let Some(ref sa) = super_admin_key_hash {
-        if caller_hash.as_deref() == Some(sa.as_str()) {
-            return true;
-        }
-    }
-    match (caller_hash, owner) {
-        (Some(caller), Some(own)) => caller == own,
-        (_, None) => true, // no owner set → unrestricted
-        _ => false,
-    }
-}
-
-/// List notification channels with search and filtering (#509 #510).
-#[utoipa::path(
-    get,
-    path = "/v1/admin/notifications/channels",
-    tag = "admin",
-    params(models::NotificationChannelSearchParams),
-    responses(
-        (status = 200, description = "Channel list"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn list_notification_channels(
+/// Record an email open event and return the 1×1 tracking pixel.
+/// GET /v1/notifications/email/track/:token
+pub async fn track_email_open(
     State(state): State<AppState>,
-    Query(params): Query<models::NotificationChannelSearchParams>,
-) -> Result<impl IntoResponse, AppError> {
-    let limit = params.effective_limit();
-    let offset = params.offset();
-    let page = params.effective_page();
-
-    // Build WHERE clause dynamically. Each optional filter increments the
-    // placeholder index; the final two placeholders are LIMIT and OFFSET.
-    let mut conditions: Vec<String> = Vec::new();
-    let mut idx: i32 = 1;
-
-    let mut bind_q: Option<String> = None;
-    let mut bind_channel_type: Option<String> = None;
-    let mut bind_contract_id: Option<String> = None;
-    let mut bind_status: Option<String> = None;
-    let mut bind_tag: Option<String> = None;
-
-    if let Some(ref q) = params.q {
-        conditions.push(format!(
-            "to_tsvector('english', name || ' ' || coalesce(description, '')) @@ plainto_tsquery('english', ${})",
-            idx
-        ));
-        bind_q = Some(q.clone());
-        idx += 1;
-    }
-    if let Some(ref ct) = params.channel_type {
-        conditions.push(format!("channel_type = ${}", idx));
-        bind_channel_type = Some(ct.clone());
-        idx += 1;
-    }
-    if let Some(ref cid) = params.contract_id {
-        conditions.push(format!("${} = ANY(contract_filter)", idx));
-        bind_contract_id = Some(cid.clone());
-        idx += 1;
-    }
-    if let Some(ref s) = params.status {
-        conditions.push(format!("status = ${}", idx));
-        bind_status = Some(s.clone());
-        idx += 1;
-    }
-    if let Some(ref tag) = params.tag {
-        conditions.push(format!("${} = ANY(tags)", idx));
-        bind_tag = Some(tag.clone());
-        idx += 1;
-    }
-
-    let where_clause = if conditions.is_empty() {
-        "1=1".to_string()
-    } else {
-        conditions.join(" AND ")
-    };
-
-    let count_sql = format!(
-        "SELECT COUNT(*) FROM notification_channels WHERE {}",
-        where_clause
-    );
-    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
-    if let Some(ref v) = bind_q { count_q = count_q.bind(v.clone()); }
-    if let Some(ref v) = bind_channel_type { count_q = count_q.bind(v.clone()); }
-    if let Some(ref v) = bind_contract_id { count_q = count_q.bind(v.clone()); }
-    if let Some(ref v) = bind_status { count_q = count_q.bind(v.clone()); }
-    if let Some(ref v) = bind_tag { count_q = count_q.bind(v.clone()); }
-    let total: i64 = count_q.fetch_one(&state.pool).await.unwrap_or(0);
-
-    let data_sql = format!(
-        "SELECT id, name, channel_type, config, retry_policy, description, tags, owner, status, \
-         contract_filter, created_at, updated_at \
-         FROM notification_channels \
-         WHERE {} \
-         ORDER BY created_at DESC \
-         LIMIT ${} OFFSET ${}",
-        where_clause, idx, idx + 1
-    );
-    let mut data_q = sqlx::query_as::<_, models::NotificationChannel>(&data_sql);
-    if let Some(ref v) = bind_q { data_q = data_q.bind(v.clone()); }
-    if let Some(ref v) = bind_channel_type { data_q = data_q.bind(v.clone()); }
-    if let Some(ref v) = bind_contract_id { data_q = data_q.bind(v.clone()); }
-    if let Some(ref v) = bind_status { data_q = data_q.bind(v.clone()); }
-    if let Some(ref v) = bind_tag { data_q = data_q.bind(v.clone()); }
-    data_q = data_q.bind(limit).bind(offset);
-    let channels = data_q.fetch_all(&state.pool).await?;
-
-    Ok(Json(models::PaginatedResponse::new(channels, page, limit, total)))
-}
-
-/// Create a notification channel.
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/channels",
-    tag = "admin",
-    request_body = models::CreateNotificationChannelRequest,
-    responses(
-        (status = 201, description = "Channel created"),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn create_notification_channel(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<models::CreateNotificationChannelRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let valid_types = ["webhook", "email", "sms"];
-    if !valid_types.contains(&req.channel_type.as_str()) {
-        return Err(AppError::Validation(format!(
-            "channel_type must be one of: {}",
-            valid_types.join(", ")
-        )));
-    }
-
-    let owner = extract_caller_key_hash(&headers);
-    let default_retry = serde_json::json!({
-        "max_attempts": 3,
-        "initial_backoff_ms": 1000,
-        "backoff_multiplier": 2.0,
-        "max_backoff_ms": 60000
-    });
-    let retry_policy = req.retry_policy.unwrap_or(default_retry);
-
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "INSERT INTO notification_channels \
-         (name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8) \
-         RETURNING id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at"
-    )
-    .bind(&req.name)
-    .bind(&req.channel_type)
-    .bind(&req.config)
-    .bind(&retry_policy)
-    .bind(&req.description)
-    .bind(&req.tags)
-    .bind(&owner)
-    .bind(&req.contract_filter)
-    .fetch_one(&state.pool)
-    .await?;
-
-    Ok((StatusCode::CREATED, Json(channel)))
-}
-
-/// Get a single notification channel by ID.
-#[utoipa::path(
-    get,
-    path = "/v1/admin/notifications/channels/{id}",
-    tag = "admin",
-    params(("id" = Uuid, Path, description = "Channel ID")),
-    responses(
-        (status = 200, description = "Channel details"),
-        (status = 404, description = "Not found"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn get_notification_channel(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<models::NotificationChannel>, AppError> {
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at \
-         FROM notification_channels WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    Ok(Json(channel))
-}
-
-/// Update a notification channel (#508: only owner or super-admin).
-#[utoipa::path(
-    put,
-    path = "/v1/admin/notifications/channels/{id}",
-    tag = "admin",
-    params(("id" = Uuid, Path, description = "Channel ID")),
-    request_body = models::UpdateNotificationChannelRequest,
-    responses(
-        (status = 200, description = "Channel updated"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Not found"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn update_notification_channel(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-    Json(req): Json<models::UpdateNotificationChannelRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at \
-         FROM notification_channels WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    let caller_hash = extract_caller_key_hash(&headers);
-    if !is_authorized_for_channel(&caller_hash, &channel.owner, &state.super_admin_key_hash) {
-        return Err(AppError::Forbidden("insufficient permissions to modify this channel".to_string()));
-    }
-
-    if let Some(ref s) = req.status {
-        let valid = ["active", "inactive", "paused"];
-        if !valid.contains(&s.as_str()) {
-            return Err(AppError::Validation(format!(
-                "status must be one of: {}",
-                valid.join(", ")
-            )));
-        }
-    }
-
-    let updated = sqlx::query_as::<_, models::NotificationChannel>(
-        "UPDATE notification_channels SET \
-         name = COALESCE($2, name), \
-         config = COALESCE($3, config), \
-         retry_policy = COALESCE($4, retry_policy), \
-         description = COALESCE($5, description), \
-         tags = COALESCE($6, tags), \
-         status = COALESCE($7, status), \
-         contract_filter = COALESCE($8, contract_filter), \
-         updated_at = NOW() \
-         WHERE id = $1 \
-         RETURNING id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at"
-    )
-    .bind(id)
-    .bind(&req.name)
-    .bind(&req.config)
-    .bind(&req.retry_policy)
-    .bind(&req.description)
-    .bind(&req.tags)
-    .bind(&req.status)
-    .bind(&req.contract_filter)
-    .fetch_one(&state.pool)
-    .await?;
-
-    Ok(Json(updated))
-}
-
-/// Delete a notification channel (#508: only owner or super-admin).
-#[utoipa::path(
-    delete,
-    path = "/v1/admin/notifications/channels/{id}",
-    tag = "admin",
-    params(("id" = Uuid, Path, description = "Channel ID")),
-    responses(
-        (status = 204, description = "Channel deleted"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Not found"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn delete_notification_channel(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "SELECT id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at \
-         FROM notification_channels WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    let caller_hash = extract_caller_key_hash(&headers);
-    if !is_authorized_for_channel(&caller_hash, &channel.owner, &state.super_admin_key_hash) {
-        return Err(AppError::Forbidden("insufficient permissions to modify this channel".to_string()));
-    }
-
-    sqlx::query("DELETE FROM notification_channels WHERE id = $1")
-        .bind(id)
-        .execute(&state.pool)
-        .await?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Add a tag to a notification channel (#509).
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/channels/{id}/tags",
-    tag = "admin",
-    params(("id" = Uuid, Path, description = "Channel ID")),
-    request_body = models::AddTagRequest,
-    responses(
-        (status = 200, description = "Tag added"),
-        (status = 404, description = "Not found"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn add_channel_tag(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(req): Json<models::AddTagRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let tag = req.tag.trim().to_string();
-    if tag.is_empty() {
-        return Err(AppError::Validation("tag must not be empty".to_string()));
-    }
-
-    let updated = sqlx::query_as::<_, models::NotificationChannel>(
-        "UPDATE notification_channels \
-         SET tags = array_append(tags, $2), updated_at = NOW() \
-         WHERE id = $1 AND NOT ($2 = ANY(tags)) \
-         RETURNING id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at"
-    )
-    .bind(id)
-    .bind(&tag)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    // If no rows updated, either channel doesn't exist or tag already present — return current state
-    let channel = match updated {
-        Some(ch) => ch,
-        None => sqlx::query_as::<_, models::NotificationChannel>(
-            "SELECT id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at \
-             FROM notification_channels WHERE id = $1"
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_opens SET opened_at = NOW()
+                WHERE token = $1 AND opened_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
         )
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(AppError::NotFound)?,
-    };
-
-    Ok(Json(channel))
-}
-
-/// Remove a tag from a notification channel (#509).
-#[utoipa::path(
-    delete,
-    path = "/v1/admin/notifications/channels/{id}/tags/{tag}",
-    tag = "admin",
-    params(
-        ("id" = Uuid, Path, description = "Channel ID"),
-        ("tag" = String, Path, description = "Tag to remove"),
-    ),
-    responses(
-        (status = 200, description = "Tag removed"),
-        (status = 404, description = "Not found"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn remove_channel_tag(
-    State(state): State<AppState>,
-    Path((id, tag)): Path<(Uuid, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let channel = sqlx::query_as::<_, models::NotificationChannel>(
-        "UPDATE notification_channels \
-         SET tags = array_remove(tags, $2), updated_at = NOW() \
-         WHERE id = $1 \
-         RETURNING id, name, channel_type, config, retry_policy, description, tags, owner, status, contract_filter, created_at, updated_at"
-    )
-    .bind(id)
-    .bind(&tag)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    Ok(Json(channel))
-}
-
-// ── Channel Group handlers (#507) ────────────────────────────────────────────
-
-/// Create a notification channel group (#507).
-#[utoipa::path(
-    post,
-    path = "/v1/admin/notifications/groups",
-    tag = "admin",
-    request_body = models::CreateChannelGroupRequest,
-    responses(
-        (status = 201, description = "Group created"),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn create_channel_group(
-    State(state): State<AppState>,
-    Json(req): Json<models::CreateChannelGroupRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let mut tx = state.pool.begin().await?;
-
-    let group = sqlx::query_as::<_, models::NotificationChannelGroup>(
-        "INSERT INTO notification_channel_groups (name, description) \
-         VALUES ($1, $2) \
-         RETURNING id, name, description, created_at, updated_at"
-    )
-    .bind(&req.name)
-    .bind(&req.description)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    for channel_id in &req.channel_ids {
-        sqlx::query(
-            "INSERT INTO notification_channel_group_members (group_id, channel_id) \
-             VALUES ($1, $2) ON CONFLICT DO NOTHING"
-        )
-        .bind(group.id)
-        .bind(channel_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    tx.commit().await?;
-
-    let response = models::ChannelGroupResponse {
-        id: group.id,
-        name: group.name,
-        description: group.description,
-        channel_ids: req.channel_ids,
-        created_at: group.created_at,
-        updated_at: group.updated_at,
-    };
-
-    Ok((StatusCode::CREATED, Json(response)))
-}
-
-/// List all notification channel groups (#507).
-#[utoipa::path(
-    get,
-    path = "/v1/admin/notifications/groups",
-    tag = "admin",
-    responses(
-        (status = 200, description = "Group list"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn list_channel_groups(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, AppError> {
-    let groups = sqlx::query_as::<_, models::NotificationChannelGroup>(
-        "SELECT id, name, description, created_at, updated_at \
-         FROM notification_channel_groups \
-         ORDER BY created_at DESC"
-    )
-    .fetch_all(&state.pool)
-    .await?;
-
-    // Fetch members for each group
-    let mut responses: Vec<models::ChannelGroupResponse> = Vec::with_capacity(groups.len());
-    for group in groups {
-        let channel_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT channel_id FROM notification_channel_group_members WHERE group_id = $1"
-        )
-        .bind(group.id)
-        .fetch_all(&state.pool)
+        .bind(&token)
+        .fetch_one(&pool)
         .await
-        .unwrap_or_default();
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_open();
+        }
+    });
 
-        responses.push(models::ChannelGroupResponse {
-            id: group.id,
-            name: group.name,
-            description: group.description,
-            channel_ids,
-            created_at: group.created_at,
-            updated_at: group.updated_at,
-        });
-    }
-
-    Ok(Json(responses))
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/gif")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header("pragma", "no-cache")
+        .body(Body::from(TRACKING_PIXEL_GIF.to_vec()))
+        .unwrap()
 }
 
-/// Delete a notification channel group (#507).
-#[utoipa::path(
-    delete,
-    path = "/v1/admin/notifications/groups/{id}",
-    tag = "admin",
-    params(("id" = Uuid, Path, description = "Group ID")),
-    responses(
-        (status = 204, description = "Group deleted"),
-        (status = 404, description = "Not found"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn delete_channel_group(
+/// Return email open-rate statistics.
+/// GET /v1/admin/notifications/email/stats
+pub async fn get_email_stats(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, AppError> {
-    let rows = sqlx::query("DELETE FROM notification_channel_groups WHERE id = $1")
-        .bind(id)
-        .execute(&state.pool)
-        .await?;
+) -> Result<Json<Value>, AppError> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
 
-    if rows.rows_affected() == 0 {
-        return Err(AppError::NotFound);
+    let opened: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_opens WHERE opened_at IS NOT NULL",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
+
+    let open_rate = if total == 0 {
+        0.0_f64
+    } else {
+        opened as f64 / total as f64 * 100.0
+    };
+
+    Ok(Json(json!({
+        "total_sent": total,
+        "total_opened": opened,
+        "open_rate_pct": open_rate,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #488 – Email click tracking
+// ---------------------------------------------------------------------------
+
+/// Record an email link click and redirect to the destination URL.
+/// GET /v1/notifications/email/click/:token
+pub async fn track_email_click(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let dest: Option<String> = sqlx::query_scalar(
+        "SELECT destination_url FROM email_clicks WHERE token = $1",
+    )
+    .bind(&token)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let pool = state.pool.clone();
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let updated = sqlx::query_scalar::<_, i64>(
+            "WITH upd AS (
+                UPDATE email_clicks SET clicked_at = NOW()
+                WHERE token = $1 AND clicked_at IS NULL
+                RETURNING 1
+             ) SELECT COUNT(*) FROM upd",
+        )
+        .bind(&token_clone)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        if updated > 0 {
+            crate::metrics::record_email_click();
+        }
+    });
+
+    match dest {
+        Some(url) => Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, url.as_str())
+            .body(Body::empty())
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("click token not found"))
+            .unwrap(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #489 – A/B test results
+// ---------------------------------------------------------------------------
+
+/// Return A/B test delivery and open-rate statistics.
+/// GET /v1/admin/notifications/email/ab-test/results
+pub async fn get_ab_test_results(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let rows = sqlx::query(
+        "SELECT d.ab_template,
+                COUNT(d.id)                               AS deliveries,
+                COUNT(o.id) FILTER (WHERE o.opened_at IS NOT NULL) AS opens
+         FROM email_deliveries d
+         LEFT JOIN email_opens o
+               ON o.email_notification_id = d.email_notification_id
+              AND o.recipient = d.recipient
+         WHERE d.ab_template IS NOT NULL
+         GROUP BY d.ab_template
+         ORDER BY d.ab_template",
+    )
+    .fetch_all(&state.read_pool)
+    .await?;
+
+    let results: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let template: Option<String> = row.try_get("ab_template").ok();
+            let deliveries: i64 = row.try_get("deliveries").unwrap_or(0);
+            let opens: i64 = row.try_get("opens").unwrap_or(0);
+            let open_rate = if deliveries == 0 {
+                0.0_f64
+            } else {
+                opens as f64 / deliveries as f64 * 100.0
+            };
+            json!({
+                "template": template,
+                "deliveries": deliveries,
+                "opens": opens,
+                "open_rate_pct": open_rate,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "results": results })))
+}
+
+// ---------------------------------------------------------------------------
+// Issue #490 – Suppression list management
+// ---------------------------------------------------------------------------
+
+/// Add an email address or webhook URL to the suppression list.
+/// POST /v1/admin/notifications/suppress
+pub async fn add_suppression(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let target = body
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target' field".to_string()))?
+        .to_string();
+
+    let target_type = body
+        .get("target_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("missing 'target_type' field".to_string()))?
+        .to_string();
+
+    if target_type != "email" && target_type != "webhook" {
+        return Err(AppError::Validation(
+            "target_type must be 'email' or 'webhook'".to_string(),
+        ));
     }
 
-    Ok(StatusCode::NO_CONTENT)
+    let reason = body.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = body
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO suppression_lists (target, target_type, reason, expires_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (target, target_type) DO UPDATE \
+             SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at \
+         RETURNING id",
+    )
+    .bind(&target)
+    .bind(&target_type)
+    .bind(&reason)
+    .bind(expires_at)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(json!({
+        "id": id,
+        "target": target,
+        "target_type": target_type,
+        "status": "suppressed",
+    })))
+}
+
+/// Remove an entry from the suppression list.
+/// DELETE /v1/admin/notifications/suppress/:id
+pub async fn remove_suppression(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let deleted: Option<String> = sqlx::query_scalar(
+        "DELETE FROM suppression_lists WHERE id = $1 RETURNING target",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match deleted {
+        Some(target) => Ok(Json(json!({ "id": id, "target": target, "status": "removed" }))),
+        None => Err(AppError::NotFound),
+    }
 }
