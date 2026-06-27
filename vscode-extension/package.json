@@ -1,0 +1,125 @@
+{
+  "name": "soroban-pulse-explorer",
+  "displayName": "Soroban Pulse Explorer",
+  "description": "Browse, test, and inspect Soroban Pulse API endpoints directly from VS Code.",
+  "version": "0.1.0",
+  "publisher": "soroban-pulse",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "keywords": ["soroban", "stellar", "blockchain", "api", "rest"],
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/soroban-pulse/soroban-pulse"
+  },
+  "activationEvents": [
+    "onView:sorobanpulse.apiExplorer"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sorobanpulse",
+          "title": "Soroban Pulse",
+          "icon": "media/pulse.svg"
+        }
+      ]
+    },
+    "views": {
+      "sorobanpulse": [
+        {
+          "id": "sorobanpulse.apiExplorer",
+          "name": "API Explorer",
+          "icon": "media/pulse.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sorobanpulse.openRequestTester",
+        "title": "Open in Request Tester",
+        "icon": "$(play)"
+      },
+      {
+        "command": "sorobanpulse.refreshExplorer",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "sorobanpulse.copyUrl",
+        "title": "Copy URL",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "sorobanpulse.openSettings",
+        "title": "Soroban Pulse: Open Settings"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sorobanpulse.refreshExplorer",
+          "when": "view == sorobanpulse.apiExplorer",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "sorobanpulse.openRequestTester",
+          "when": "view == sorobanpulse.apiExplorer && viewItem == endpoint",
+          "group": "inline"
+        },
+        {
+          "command": "sorobanpulse.copyUrl",
+          "when": "view == sorobanpulse.apiExplorer && viewItem == endpoint"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Soroban Pulse",
+      "properties": {
+        "sorobanpulse.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:3000",
+          "description": "Base URL of the Soroban Pulse API server."
+        },
+        "sorobanpulse.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key sent as the x-api-key header."
+        },
+        "sorobanpulse.adminApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Admin API key for /admin/* endpoints."
+        },
+        "sorobanpulse.timeoutMs": {
+          "type": "number",
+          "default": 10000,
+          "description": "Request timeout in milliseconds."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "@vscode/vsce": "^2.22.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.3.0"
+  }
+}
