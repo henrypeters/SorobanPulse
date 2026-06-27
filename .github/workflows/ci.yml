@@ -95,6 +95,25 @@ jobs:
       - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev
       - run: cargo test
 
+  contract-tests:
+    name: Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: cargo test --test pact_contract_tests
+      - name: Upload contract tests report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-tests-report
+          path: target/debug/deps/pact_contract_tests-*
+          retention-days: 7
+          if-no-files-found: ignore
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
@@ -166,6 +185,35 @@ jobs:
         with:
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - run: cargo bench
+
+  mutants:
+    name: Mutation Testing (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        include:
+          - module: src/models.rs
+            description: "Data models"
+          - module: src/indexer.rs
+            description: "Event indexer"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: cargo install cargo-mutants
+      - name: Run mutation tests for ${{ matrix.description }}
+        run: cargo mutants -m ${{ matrix.module }} --shuffle -j 4 || true
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report-${{ matrix.module }}
+          path: target/mutants/
+          retention-days: 7
+          if-no-files-found: ignore
 
   fuzz:
     name: Fuzz (60s per target)
