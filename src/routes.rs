@@ -9,10 +9,36 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 use tower_governor::{
+    errors::GovernorError,
     governor::GovernorConfigBuilder,
-    key_extractor::{PeerIpKeyExtractor, SmartIpKeyExtractor},
+    key_extractor::{KeyExtractor, PeerIpKeyExtractor, SmartIpKeyExtractor},
     GovernorLayer,
 };
+
+/// Rate-limit key extractor for multi-tenant mode.
+/// Uses the raw API key from Authorization or X-Api-Key as the bucket key so
+/// each tenant gets an independent quota regardless of IP address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApiKeyExtractor;
+
+impl KeyExtractor for ApiKeyExtractor {
+    type Key = String;
+
+    fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, GovernorError> {
+        let bearer = req
+            .headers()
+            .get("Authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|s| s.to_string());
+        let x_api_key = req
+            .headers()
+            .get("X-Api-Key")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        bearer.or(x_api_key).ok_or(GovernorError::UnableToExtractKey)
+    }
+}
 use tower_http::{
     compression::CompressionLayer,
     cors::CorsLayer,
@@ -480,7 +506,41 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/metrics", get(handlers::metrics));
 
     // All other routes — subject to rate limiting.
-    let rate_limited_routes = if behind_proxy {
+    let rate_limited_routes = if config.multi_tenant {
+        // In multi-tenant mode rate-limit per API key so each tenant has an
+        // independent quota regardless of IP (tenants may share egress IPs).
+        let effective_limit = config
+            .tenant_rate_limit_per_minute
+            .unwrap_or(rate_limit_per_minute);
+        let replenish_ms_t = 60_000u64 / u64::from(effective_limit.max(1));
+        let burst_t = effective_limit.max(1);
+        let governor_conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_millisecond(replenish_ms_t)
+                .burst_size(burst_t)
+                .key_extractor(ApiKeyExtractor)
+                .use_headers()
+                .finish()
+                .expect("invalid governor config"),
+        );
+        Router::new()
+            .route("/status", get(handlers::status))
+            .route("/openapi.json", get(handlers::openapi_json))
+            .route("/docs", get(handlers::swagger_ui))
+            .nest("/v1", v1)
+            .merge(deprecated)
+            .layer(axum::middleware::from_fn(
+                |req: Request<Body>, next: axum::middleware::Next| async move {
+                    let resp = next.run(req).await;
+                    if resp.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                        metrics::record_rate_limit_rejected();
+                        return rate_limit_json_response(resp);
+                    }
+                    resp
+                },
+            ))
+            .layer(GovernorLayer::new(governor_conf))
+    } else if behind_proxy {
         let governor_conf = Arc::new(
             GovernorConfigBuilder::default()
                 .per_millisecond(replenish_ms)
