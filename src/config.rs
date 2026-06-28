@@ -368,6 +368,30 @@ pub struct Config {
     pub oncall_pagerduty_api_key: Option<SecretString>,
     pub oncall_schedule_id: Option<String>,
     pub oncall_schedule_cache_ttl_secs: u64,
+
+    // Issue #610: Application-level gzip compression for event_data
+    /// When true, event_data is gzip-compressed before writing to event_data_compressed.
+    pub event_compression_enabled: bool,
+    /// Batch size when migrating existing events to compressed format.
+    pub event_compression_migration_batch_size: i64,
+
+    // Issue #609: Multi-chain support
+    /// The chain_id this indexer instance stamps on indexed events (default "mainnet").
+    pub chain_id: String,
+    /// Comma-separated list of additional network chain_ids to spin up indexer workers for.
+    pub additional_chain_ids: Vec<String>,
+
+    // Issue #608: Ledger hash tracking
+    /// When true, store ledger hashes and verify continuity on startup.
+    pub ledger_hash_tracking_enabled: bool,
+    /// Number of ledgers to check during startup hash-chain validation.
+    pub ledger_hash_validation_depth: u64,
+
+    // Issue #607: Contract ABI caching
+    /// TTL in seconds for the in-process ABI cache (default 86400 = 24 h).
+    pub abi_cache_ttl_secs: u64,
+    /// Maximum number of ABIs kept in the in-process cache.
+    pub abi_cache_max_entries: u64,
 }
 
 impl Default for Config {
@@ -500,6 +524,14 @@ impl Default for Config {
             oncall_pagerduty_api_key: None,
             oncall_schedule_id: None,
             oncall_schedule_cache_ttl_secs: 300,
+            event_compression_enabled: false,
+            event_compression_migration_batch_size: 500,
+            chain_id: "mainnet".to_string(),
+            additional_chain_ids: Vec::new(),
+            ledger_hash_tracking_enabled: false,
+            ledger_hash_validation_depth: 1_000,
+            abi_cache_ttl_secs: crate::abi::DEFAULT_ABI_CACHE_TTL_SECS,
+            abi_cache_max_entries: crate::abi::ABI_CACHE_MAX_ENTRIES,
         }
     }
 }
@@ -1429,6 +1461,40 @@ impl Config {
             oncall_schedule_cache_ttl_secs: env_or_file("ONCALL_SCHEDULE_CACHE_TTL_SECS", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            // Issue #610: Event compression
+            event_compression_enabled: env_or_file("EVENT_COMPRESSION_ENABLED", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or(false),
+            event_compression_migration_batch_size: env_or_file(
+                "EVENT_COMPRESSION_MIGRATION_BATCH_SIZE",
+                &file,
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500),
+            // Issue #609: Multi-chain
+            chain_id: env_or_file_or("CHAIN_ID", &file, "mainnet"),
+            additional_chain_ids: env_or_file("ADDITIONAL_CHAIN_IDS", &file)
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            // Issue #608: Ledger hash tracking
+            ledger_hash_tracking_enabled: env_or_file("LEDGER_HASH_TRACKING_ENABLED", &file)
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
+                .unwrap_or(false),
+            ledger_hash_validation_depth: env_or_file("LEDGER_HASH_VALIDATION_DEPTH", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000),
+            // Issue #607: ABI cache
+            abi_cache_ttl_secs: env_or_file("ABI_CACHE_TTL_SECS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::abi::DEFAULT_ABI_CACHE_TTL_SECS),
+            abi_cache_max_entries: env_or_file("ABI_CACHE_MAX_ENTRIES", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::abi::ABI_CACHE_MAX_ENTRIES),
         }
     }
 }

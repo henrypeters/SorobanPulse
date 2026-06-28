@@ -96,6 +96,8 @@ pub struct AppState {
     pub sse_connections_per_ip: Arc<DashMap<String, usize>>,
     /// SHA-256 hex of SUPER_ADMIN_API_KEY, grants unrestricted channel access (#508).
     pub super_admin_key_hash: Option<String>,
+    /// Issue #607: In-process ABI cache (LRU-bounded, 24 h TTL by default).
+    pub abi_cache: crate::abi::AbiCache,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -326,6 +328,12 @@ pub fn create_router_with_tx_and_tenant_map(
         .filter(|s| !s.is_empty())
         .map(|k| crate::middleware::hash_api_key(&k));
 
+    // Issue #607: build the ABI cache from config.
+    let abi_cache = moka::future::Cache::builder()
+        .max_capacity(config.abi_cache_max_entries)
+        .time_to_live(std::time::Duration::from_secs(config.abi_cache_ttl_secs))
+        .build();
+
     let app_state = AppState {
         pool,
         read_pool,
@@ -347,6 +355,7 @@ pub fn create_router_with_tx_and_tenant_map(
         shutdown_rx,
         sse_connections_per_ip: Arc::new(DashMap::new()),
         super_admin_key_hash,
+        abi_cache,
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
@@ -455,7 +464,17 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/replication/status", axum::routing::get(handlers::get_replication_status))
         // #587: Feature flag management
         .route("/admin/feature-flags", axum::routing::get(handlers::list_feature_flags))
-        .route("/admin/feature-flags/audit", axum::routing::get(handlers::get_feature_flag_audit));
+        .route("/admin/feature-flags/audit", axum::routing::get(handlers::get_feature_flag_audit))
+        // Issue #609: Multi-chain networks
+        .route("/networks", axum::routing::get(handlers::list_networks))
+        // Issue #608: Ledger hash endpoints
+        .route("/ledgers/{ledger}/hash", axum::routing::get(handlers::get_ledger_hash))
+        .route("/ledgers/verify-chain", axum::routing::get(handlers::verify_ledger_hash_chain))
+        // Issue #610: Compression admin endpoints
+        .route("/admin/compression/stats", axum::routing::get(handlers::compression_stats))
+        .route("/admin/compression/migrate", axum::routing::post(handlers::start_compression_migration))
+        // Issue #607: Cached ABI endpoint
+        .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)

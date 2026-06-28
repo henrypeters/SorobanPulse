@@ -3825,8 +3825,10 @@ pub async fn register_contract_abi(
     Json(abi): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     validate_contract_id(&contract_id)?;
-    if !abi.is_array() {
-        return Err(AppError::Validation("ABI must be a JSON array".to_string()));
+    // Issue #607: validate ABI structure before persisting.
+    if let Err(e) = crate::abi::validate_abi(&abi) {
+        crate::metrics::record_abi_validation_failure(&contract_id);
+        return Err(AppError::Validation(e));
     }
     sqlx::query(
         "INSERT INTO contract_abis (contract_id, abi, updated_at)
@@ -3837,6 +3839,9 @@ pub async fn register_contract_abi(
     .bind(&abi)
     .execute(&state.pool)
     .await?;
+
+    // Issue #607: invalidate the in-process cache so the next read fetches fresh data.
+    crate::abi::invalidate_abi_cache(&state.abi_cache, &contract_id).await;
 
     let pool = state.pool.clone();
     let backfill_contract_id = contract_id.clone();
@@ -11383,6 +11388,196 @@ pub async fn get_feature_flag_audit(State(state): State<AppState>) -> Result<Jso
 
     let count = entries.len();
     Ok(Json(json!({ "entries": entries, "count": count })))
+}
+
+// ── Issue #609: GET /v1/networks ─────────────────────────────────────────────
+
+/// List all registered Soroban networks and their health status.
+///
+/// `GET /v1/networks`
+#[utoipa::path(
+    get,
+    path = "/v1/networks",
+    tag = "system",
+    responses(
+        (status = 200, description = "List of registered networks"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
+pub async fn list_networks(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let networks = crate::networks::list_networks(&state.pool).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({
+        "count": networks.len(),
+        "networks": networks,
+    })))
+}
+
+// ── Issue #608: GET /v1/ledgers/{ledger}/hash ────────────────────────────────
+
+/// Return the indexed hash for a specific ledger sequence number.
+///
+/// `GET /v1/ledgers/{ledger}/hash`
+#[utoipa::path(
+    get,
+    path = "/v1/ledgers/{ledger}/hash",
+    tag = "events",
+    params(
+        ("ledger" = u64, Path, description = "Ledger sequence number"),
+    ),
+    responses(
+        (status = 200, description = "Ledger hash"),
+        (status = 404, description = "Ledger not found"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
+pub async fn get_ledger_hash(
+    State(state): State<AppState>,
+    Path(ledger): Path<u64>,
+) -> Result<Json<Value>, AppError> {
+    match crate::ledger_hashes::get_ledger_hash(&state.pool, ledger).await {
+        Ok(Some(hash)) => Ok(Json(json!({ "ledger": ledger, "hash": hash }))),
+        Ok(None) => Err(AppError::NotFound),
+        Err(e) => Err(AppError::Internal(e.to_string())),
+    }
+}
+
+/// Verify the hash chain for a ledger range.
+///
+/// `GET /v1/ledgers/verify-chain?from={from}&to={to}`
+#[utoipa::path(
+    get,
+    path = "/v1/ledgers/verify-chain",
+    tag = "events",
+    params(
+        ("from" = u64, Query, description = "Start ledger (inclusive)"),
+        ("to"   = u64, Query, description = "End ledger (inclusive)"),
+    ),
+    responses(
+        (status = 200, description = "Hash chain verification result"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
+pub async fn verify_ledger_hash_chain(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let from: u64 = params
+        .get("from")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let to: u64 = params
+        .get("to")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(from);
+    let mismatches = crate::ledger_hashes::verify_hash_chain(&state.pool, from, to)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(json!({
+        "from": from,
+        "to": to,
+        "mismatches": mismatches,
+        "ok": mismatches == 0,
+    })))
+}
+
+// ── Issue #610: GET /v1/admin/compression-stats ──────────────────────────────
+
+/// Return compression statistics and trigger a backfill migration when enabled.
+///
+/// `GET /v1/admin/compression-stats`
+#[utoipa::path(
+    get,
+    path = "/v1/admin/compression-stats",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Compression statistics"),
+        (status = 500, description = "Internal server error"),
+    )
+)]
+pub async fn compression_stats(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let compressed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_data_compressed IS NOT NULL")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    let enabled = state.config.event_compression_enabled;
+    Ok(Json(json!({
+        "enabled": enabled,
+        "total_events": total,
+        "compressed_events": compressed,
+        "uncompressed_events": total - compressed,
+        "coverage_pct": if total > 0 { (compressed as f64 / total as f64) * 100.0 } else { 0.0 },
+    })))
+}
+
+/// Trigger a background migration that gzip-compresses all uncompressed events.
+///
+/// `POST /v1/admin/compression-migrate`
+#[utoipa::path(
+    post,
+    path = "/v1/admin/compression-migrate",
+    tag = "admin",
+    responses(
+        (status = 202, description = "Migration started"),
+        (status = 400, description = "Compression is disabled"),
+    )
+)]
+pub async fn start_compression_migration(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if !state.config.event_compression_enabled {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "EVENT_COMPRESSION_ENABLED is false" })),
+        );
+    }
+    let pool = state.pool.clone();
+    let batch = state.config.event_compression_migration_batch_size;
+    tokio::spawn(async move {
+        match crate::event_compression::migrate_existing_events(&pool, batch).await {
+            Ok(n) => tracing::info!(migrated = n, "compression migration complete"),
+            Err(e) => tracing::error!(error = %e, "compression migration failed"),
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "status": "started" })))
+}
+
+// ── Issue #607: GET /v1/contracts/{contract_id}/abi (cached) ─────────────────
+
+/// Return the cached ABI for a contract (cache-backed, with hit/miss metrics).
+///
+/// `GET /v1/contracts/{contract_id}/abi/cached`
+#[utoipa::path(
+    get,
+    path = "/v1/contracts/{contract_id}/abi/cached",
+    tag = "events",
+    params(
+        ("contract_id" = String, Path, description = "Contract ID"),
+    ),
+    responses(
+        (status = 200, description = "Contract ABI"),
+        (status = 404, description = "ABI not found"),
+    )
+)]
+pub async fn get_contract_abi_cached(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    match crate::abi::fetch_contract_abi(&state.pool, &state.abi_cache, &contract_id).await {
+        Some(abi) => Ok(Json(json!({ "contract_id": contract_id, "abi": abi }))),
+        None => Err(AppError::NotFound),
+    }
+}
+
 #[cfg(test)]
 mod temporal_tests {
     use super::*;

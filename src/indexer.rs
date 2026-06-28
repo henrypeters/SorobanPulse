@@ -459,6 +459,11 @@ impl<R: RpcClient> Indexer<R> {
             metrics::record_indexer_is_leader(false);
         }
 
+        // Issue #608: validate ledger hash chain on startup when enabled.
+        if self.config.ledger_hash_tracking_enabled {
+            crate::ledger_hashes::startup_hash_chain_validation(&self.pool).await;
+        }
+
         // Run the actual indexing loop; release lock on exit.
         self.run_loop().await;
 
@@ -1122,9 +1127,29 @@ impl<R: RpcClient> Indexer<R> {
             None
         };
 
+        // Issue #610: gzip-compress event_data when enabled.
+        let (compressed_bytes, compression_algo): (Option<Vec<u8>>, Option<&str>) =
+            if self.config.event_compression_enabled {
+                match crate::event_compression::compress(&event_data) {
+                    Ok(b) => {
+                        crate::metrics::record_compression_ratio(serialized.len(), b.len());
+                        (Some(b), Some("gzip"))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "compression failed, storing plain event_data");
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+        // Issue #609: stamp chain_id on every inserted event.
+        let chain_id = &self.config.chain_id;
+
         let result = sqlx::query(
-            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint, event_data_compressed, compression_algo, chain_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                ON CONFLICT (tx_hash, contract_id, event_type) DO NOTHING"#,
         )
         .bind(&event.contract_id)
@@ -1138,6 +1163,9 @@ impl<R: RpcClient> Indexer<R> {
         .bind(event_data_decoded)
         .bind(tenant_id)
         .bind(&fingerprint)
+        .bind(compressed_bytes.as_deref())
+        .bind(compression_algo)
+        .bind(chain_id)
         .execute(&mut **tx)
         .await?;
 
@@ -1147,6 +1175,26 @@ impl<R: RpcClient> Indexer<R> {
             // Record in bloom filter after successful insert
             if let Some(ref bloom) = self.bloom_filter {
                 bloom.set(&event.tx_hash, &event.contract_id, &event.event_type);
+            }
+            // Issue #608: persist ledger hash when tracking is enabled.
+            if self.config.ledger_hash_tracking_enabled {
+                if let Some(ref hash) = event.ledger_hash {
+                    let pool = self.pool.clone();
+                    let ledger_num = event.ledger;
+                    let hash_owned = hash.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::ledger_hashes::store_ledger_hash(
+                            &pool,
+                            ledger_num,
+                            &hash_owned,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, ledger = ledger_num, "failed to store ledger hash");
+                        }
+                    });
+                }
             }
         }
         Ok(rows)

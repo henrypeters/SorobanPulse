@@ -1,5 +1,8 @@
 pub mod abi;
 pub mod codegen;
+pub mod event_compression;
+pub mod ledger_hashes;
+pub mod networks;
 pub mod audit_logging;
 pub mod bloom_filter;
 pub mod capacity_planning;

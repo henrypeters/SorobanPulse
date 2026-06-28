@@ -1,6 +1,73 @@
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::sync::Arc;
 use stellar_xdr::curr::ScVal;
+
+/// Default ABI cache TTL in seconds (24 hours).
+pub const DEFAULT_ABI_CACHE_TTL_SECS: u64 = 86_400;
+/// Maximum number of entries kept in the in-process LRU cache.
+pub const ABI_CACHE_MAX_ENTRIES: u64 = 10_000;
+
+pub type AbiCache = moka::future::Cache<String, Value>;
+
+/// Build an in-process ABI cache capped at `ABI_CACHE_MAX_ENTRIES`.
+pub fn build_abi_cache() -> AbiCache {
+    moka::future::Cache::builder()
+        .max_capacity(ABI_CACHE_MAX_ENTRIES)
+        .time_to_live(std::time::Duration::from_secs(DEFAULT_ABI_CACHE_TTL_SECS))
+        .eviction_listener(|_key, _val, _cause| {
+            crate::metrics::record_abi_cache_eviction();
+        })
+        .build()
+}
+
+/// Validate that an ABI value is a JSON array whose entries each have a "name" field.
+pub fn validate_abi(abi: &Value) -> Result<(), String> {
+    let entries = abi
+        .as_array()
+        .ok_or_else(|| "ABI must be a JSON array".to_string())?;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.get("name").and_then(Value::as_str).is_none() {
+            return Err(format!("ABI entry {i} is missing a \"name\" field"));
+        }
+    }
+    Ok(())
+}
+
+/// Fetch a contract ABI, using the in-process cache as the first layer and
+/// falling back to the database.  Cache hits / misses are recorded as metrics.
+pub async fn fetch_contract_abi(
+    pool: &PgPool,
+    cache: &AbiCache,
+    contract_id: &str,
+) -> Option<Value> {
+    if let Some(abi) = cache.get(contract_id).await {
+        crate::metrics::record_abi_cache_hit(contract_id);
+        return Some(abi);
+    }
+    crate::metrics::record_abi_cache_miss(contract_id);
+
+    let row = sqlx::query!(
+        "SELECT abi FROM contract_abis
+         WHERE contract_id = $1
+           AND (expires_at IS NULL OR expires_at > NOW())",
+        contract_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+
+    let abi = row.abi;
+    cache.insert(contract_id.to_string(), abi.clone()).await;
+    Some(abi)
+}
+
+/// Invalidate the in-process cache entry for `contract_id`.
+/// Called after an ABI is updated so the next read fetches fresh data.
+pub async fn invalidate_abi_cache(cache: &AbiCache, contract_id: &str) {
+    cache.invalidate(contract_id).await;
+}
 
 pub fn decode_event_data(abi: &Value, event_data: &Value) -> Option<Value> {
     let event_name = event_name_from_topic(event_data.get("topic")?)?;
@@ -30,6 +97,18 @@ pub fn decode_event_data(abi: &Value, event_data: &Value) -> Option<Value> {
     Some(Value::Object(decoded))
 }
 
+/// Decode using the cached ABI for `contract_id`.
+pub async fn decode_event_with_cached_abi(
+    pool: &PgPool,
+    cache: &AbiCache,
+    contract_id: &str,
+    event_data: &Value,
+) -> Option<Value> {
+    let abi = fetch_contract_abi(pool, cache, contract_id).await?;
+    decode_event_data(&abi, event_data)
+}
+
+/// Legacy version that hits the DB directly (kept for backwards compatibility).
 pub async fn decode_event_with_registered_abi(
     pool: &PgPool,
     contract_id: &str,
@@ -155,5 +234,21 @@ mod tests {
         let decoded = decode_event_data(&abi, &event_data).unwrap();
         assert_eq!(decoded["event"], "transfer");
         assert_eq!(decoded["amount"], "1000");
+    }
+
+    #[test]
+    fn validate_abi_rejects_non_array() {
+        assert!(validate_abi(&json!({"name": "foo"})).is_err());
+    }
+
+    #[test]
+    fn validate_abi_rejects_entry_without_name() {
+        assert!(validate_abi(&json!([{"inputs": []}])).is_err());
+    }
+
+    #[test]
+    fn validate_abi_accepts_well_formed() {
+        let abi = json!([{"name": "transfer", "inputs": []}]);
+        assert!(validate_abi(&abi).is_ok());
     }
 }

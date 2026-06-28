@@ -406,6 +406,98 @@ pub fn update_notification_rate_per_minute(channel: &str, rate: f64) {
     .set(rate);
 }
 
+// ── Issue #607: Contract ABI cache metrics ───────────────────────────────────
+
+pub fn record_abi_cache_hit(contract_id: &str) {
+    m::counter!(
+        "soroban_pulse_abi_cache_hits_total",
+        "contract_id" => contract_id.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_abi_cache_miss(contract_id: &str) {
+    m::counter!(
+        "soroban_pulse_abi_cache_misses_total",
+        "contract_id" => contract_id.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_abi_validation_failure(contract_id: &str) {
+    m::counter!(
+        "soroban_pulse_abi_validation_failures_total",
+        "contract_id" => contract_id.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_abi_cache_eviction() {
+    m::counter!("soroban_pulse_abi_cache_evictions_total").increment(1);
+}
+
+// ── Issue #608: Ledger hash metrics ─────────────────────────────────────────
+
+pub fn record_ledger_hash_mismatch(ledger: u64) {
+    m::counter!(
+        "soroban_pulse_ledger_hash_mismatches_total",
+        "ledger" => ledger.to_string()
+    )
+    .increment(1);
+}
+
+pub fn record_ledger_hash_verified() {
+    m::counter!("soroban_pulse_ledger_hashes_verified_total").increment(1);
+}
+
+pub fn update_ledger_hash_chain_height(ledger: u64) {
+    m::gauge!("soroban_pulse_ledger_hash_chain_height").set(ledger as f64);
+}
+
+// ── Issue #609: Multi-chain / network metrics ────────────────────────────────
+
+pub fn update_network_health(chain_id: &str, healthy: bool) {
+    m::gauge!(
+        "soroban_pulse_network_healthy",
+        "chain_id" => chain_id.to_string()
+    )
+    .set(if healthy { 1.0 } else { 0.0 });
+}
+
+pub fn update_network_latest_ledger(chain_id: &str, ledger: u64) {
+    m::gauge!(
+        "soroban_pulse_network_latest_ledger",
+        "chain_id" => chain_id.to_string()
+    )
+    .set(ledger as f64);
+}
+
+pub fn record_network_indexer_error(chain_id: &str) {
+    m::counter!(
+        "soroban_pulse_network_indexer_errors_total",
+        "chain_id" => chain_id.to_string()
+    )
+    .increment(1);
+}
+
+// ── Issue #610: Compression metrics ─────────────────────────────────────────
+
+pub fn record_compression_ratio(original_bytes: usize, compressed_bytes: usize) {
+    if original_bytes > 0 {
+        let ratio = compressed_bytes as f64 / original_bytes as f64;
+        m::histogram!("soroban_pulse_compression_ratio").record(ratio);
+    }
+    m::counter!("soroban_pulse_events_compressed_total").increment(1);
+    m::counter!(
+        "soroban_pulse_compression_bytes_saved_total"
+    )
+    .increment(original_bytes.saturating_sub(compressed_bytes) as u64);
+}
+
+pub fn record_decompression_failure() {
+    m::counter!("soroban_pulse_decompression_failures_total").increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
