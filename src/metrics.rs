@@ -218,6 +218,15 @@ pub fn record_replay_job() {
     m::counter!("soroban_pulse_replay_jobs_total").increment(1);
 }
 
+/// Record a feature flag auto-rollback event (#587)
+pub fn record_feature_flag_rollback(flag_name: &str) {
+    m::counter!(
+        "soroban_pulse_feature_flag_rollback_total",
+        "flag_name" => flag_name.to_string()
+    )
+    .increment(1);
+}
+
 /// Record the number of database migrations applied during a run (issue #411)
 pub fn record_migrations_applied(count: u64) {
     m::counter!("soroban_pulse_migrations_applied_total").increment(count);
@@ -268,6 +277,24 @@ pub fn update_ws_connections(count: usize) {
 pub fn record_timeseries_query_duration(duration: std::time::Duration) {
     m::histogram!("soroban_pulse_timeseries_query_duration_seconds")
         .record(duration.as_secs_f64());
+}
+
+/// Record temporal query duration (Issue #581)
+pub fn record_temporal_query_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_temporal_query_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a content-fingerprint deduplication hit (Issue #582).
+/// Incremented when an event is skipped because its fingerprint matches a
+/// recently stored event, indicating a content-identical retry.
+pub fn record_content_dedup_hit() {
+    m::counter!("soroban_pulse_content_dedup_hits_total").increment(1);
+}
+
+/// Record that an event fingerprint was computed and stored (Issue #582).
+pub fn record_fingerprint_stored() {
+    m::counter!("soroban_pulse_fingerprints_stored_total").increment(1);
 }
 
 /// Record contract history query duration

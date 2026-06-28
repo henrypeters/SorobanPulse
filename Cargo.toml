@@ -126,6 +126,8 @@ optional = true
 [[bin]]
 name = "gen_postman"
 path = "src/bin/gen_postman.rs"
+name = "gen_subscription_scaffold"
+path = "src/bin/gen_subscription_scaffold.rs"
 
 [[bench]]
 name = "pagination"

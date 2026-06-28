@@ -1,4 +1,5 @@
 pub mod abi;
+pub mod codegen;
 pub mod audit_logging;
 pub mod bloom_filter;
 pub mod config;
@@ -28,3 +29,4 @@ pub mod subscriptions;
 pub mod webhook;
 pub mod webhook_verification;
 pub mod xdr_validation;
+pub mod financial_accuracy;

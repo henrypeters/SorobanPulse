@@ -10,6 +10,7 @@ mod bloom_filter;
 mod config;
 mod content_filter;
 mod db;
+mod dedup;
 mod email;
 mod encryption;
 mod error;
@@ -51,6 +52,8 @@ mod saved_queries;
 mod abi;
 mod oncall;
 mod xdr_validation;
+mod replica_monitor;
+mod feature_flags;
 
 #[cfg(feature = "archive")]
 mod archiver;
@@ -495,6 +498,12 @@ async fn main() -> anyhow::Result<()> {
         config.index_check_interval_hours,
         shutdown_rx.clone(),
     );
+
+    // Spawn replica sync monitoring background task (#586)
+    replica_monitor::spawn(pool.clone(), 60, shutdown_rx.clone());
+
+    // Spawn feature flag rollback watcher (#587)
+    feature_flags::spawn(pool.clone(), 60, shutdown_rx.clone());
 
     // Spawn materialized-view refresh background task
     stats_refresh::spawn(
