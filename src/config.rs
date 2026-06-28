@@ -271,6 +271,10 @@ pub struct Config {
     /// tenant_id in the api_key_tenants table and all queries are scoped to that
     /// tenant.  Disabled by default to preserve single-tenant behaviour.
     pub multi_tenant: bool,
+    /// Per-tenant request rate limit (requests per minute).
+    /// When set and multi_tenant is true, each API key (tenant) gets this quota
+    /// instead of sharing the global RATE_LIMIT_PER_MINUTE pool.
+    pub tenant_rate_limit_per_minute: Option<u32>,
     /// Per-tenant contract filter for the indexer.
     /// Format: "tenant1:CABC...,CDEF...;tenant2:CXYZ..."
     /// When set, the indexer only stores events whose contract_id appears in the
@@ -427,6 +431,7 @@ impl Default for Config {
             contract_count_cache_ttl_secs: 30,
             indexer_lock_retry_secs: 30,
             multi_tenant: false,
+            tenant_rate_limit_per_minute: None,
             tenant_contract_filter: std::collections::HashMap::new(),
             indexer_tenant_id: None,
             email_smtp_host: None,
@@ -1235,6 +1240,9 @@ impl Config {
             multi_tenant: env_or_file("MULTI_TENANT", &file)
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or(false),
+            tenant_rate_limit_per_minute: env_or_file("TENANT_RATE_LIMIT_PER_MINUTE", &file)
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|n| *n > 0),
             tenant_contract_filter: parse_tenant_contract_filter(),
             indexer_tenant_id: env_or_file("INDEXER_TENANT_ID", &file),
             email_smtp_host: env_or_file("EMAIL_SMTP_HOST", &file),
