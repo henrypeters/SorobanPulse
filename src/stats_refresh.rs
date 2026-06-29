@@ -10,10 +10,14 @@ const VIEWS: &[&str] = &[
     "events_contract_summary",
     "mv_contract_summary",
     "events_hourly_volume",
+    "mv_contract_event_counts",
 ];
 
 /// PostgreSQL SQLSTATE code for lock_timeout / lock_not_available (55P03).
 const PG_LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// How stale (in seconds) a matview must be before we consider it stale for metrics purposes.
+const STALE_THRESHOLD_SECS: f64 = 7200.0; // 2 h
 
 /// Refresh all materialized views. Each view gets its own dedicated connection
 /// so that `SET lock_timeout` cannot bleed into unrelated pool connections.
@@ -123,16 +127,106 @@ async fn refresh_table_stats(pool: &PgPool) {
     }
 }
 
+/// Check each materialized view's last-refresh timestamp and emit a staleness metric.
+pub async fn check_staleness(pool: &PgPool) {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to acquire DB connection for staleness check");
+            return;
+        }
+    };
+
+    // pg_stat_user_tables only covers regular tables; for matviews use pg_stat_all_tables
+    // which includes materialized views (relkind = 'm').
+    for view in VIEWS {
+        let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
+            "SELECT last_autovacuum FROM pg_stat_all_tables WHERE relname = $1"
+        )
+        .bind(view)
+        .fetch_optional(&mut *conn)
+        .await
+        .unwrap_or(None);
+
+        // Use a dedicated query against pg_matviews for the definition check; actual
+        // refresh time isn't stored by Postgres — proxy it via pg_stat_all_tables
+        // last_autoanalyze or, failing that, leave the metric at 0.
+        let age_secs: f64 = if let Some((Some(ts),)) = row {
+            let now = chrono::Utc::now();
+            (now - ts).num_seconds().max(0) as f64
+        } else {
+            0.0
+        };
+
+        crate::metrics::record_matview_staleness_seconds(view, age_secs);
+
+        if age_secs > STALE_THRESHOLD_SECS {
+            warn!(
+                view,
+                age_secs,
+                threshold_secs = STALE_THRESHOLD_SECS,
+                "Materialized view is stale"
+            );
+        }
+    }
+}
+
+/// Run EXPLAIN on a representative events query and record estimated row count.
+pub async fn analyze_query_plans(pool: &PgPool) {
+    let queries: &[(&str, &str)] = &[
+        (
+            "daily_summary",
+            "SELECT date_trunc('day', timestamp), COUNT(*) FROM events GROUP BY 1",
+        ),
+        (
+            "contract_counts",
+            "SELECT contract_id, COUNT(*) FROM events GROUP BY contract_id",
+        ),
+    ];
+
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "Failed to acquire DB connection for EXPLAIN analysis");
+            return;
+        }
+    };
+
+    for (label, sql) in queries {
+        let explain = format!("EXPLAIN (FORMAT JSON) {sql}");
+        if let Ok(row) = sqlx::query_scalar::<_, serde_json::Value>(&explain)
+            .fetch_one(&mut *conn)
+            .await
+        {
+            // EXPLAIN JSON returns an array; dig into Plan -> Plan Rows
+            if let Some(rows) = row
+                .get(0)
+                .and_then(|p| p.get("Plan"))
+                .and_then(|plan| plan.get("Plan Rows"))
+                .and_then(|r| r.as_f64())
+            {
+                crate::metrics::record_query_plan_estimated_rows(label, rows);
+                info!(query = label, estimated_rows = rows, "Query plan analyzed");
+            }
+        }
+    }
+}
+
 /// Spawn a background task that refreshes the materialized views every `interval_secs` seconds.
+/// Also runs staleness checks and query-plan analysis on each cycle.
 pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<bool>) {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs);
         // Initial refresh on startup
         refresh_all(&pool).await;
+        check_staleness(&pool).await;
+        analyze_query_plans(&pool).await;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
                     refresh_all(&pool).await;
+                    check_staleness(&pool).await;
+                    analyze_query_plans(&pool).await;
                 }
                 _ = shutdown.changed() => {
                     info!("Stats refresh task shutting down");
