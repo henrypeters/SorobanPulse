@@ -1,0 +1,273 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 700" font-family="system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L0,10 L10,5 z" fill="#64748b"/>
+    </marker>
+    <marker id="ah-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L0,10 L10,5 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="ah-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L0,10 L10,5 z" fill="#16a34a"/>
+    </marker>
+    <marker id="ah-orange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L0,10 L10,5 z" fill="#ea580c"/>
+    </marker>
+    <marker id="ah-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L0,10 L10,5 z" fill="#0d9488"/>
+    </marker>
+    <marker id="ah-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L0,10 L10,5 z" fill="#9333ea"/>
+    </marker>
+  </defs>
+
+  <!-- Canvas -->
+  <rect width="1200" height="700" fill="#f8fafc" rx="10"/>
+
+  <!-- Title -->
+  <text x="600" y="36" text-anchor="middle" font-size="19" font-weight="700" fill="#0f172a">SorobanPulse System Architecture</text>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- TOP FLOW: main event indexing path                             -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- LANE 1 — Stellar Network -->
+  <rect x="10" y="55" width="190" height="285" fill="#eff6ff" rx="8" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="105" y="74" text-anchor="middle" font-size="10" font-weight="700" fill="#1d4ed8" letter-spacing="0.8">STELLAR NETWORK</text>
+
+  <rect x="25" y="83" width="160" height="68" fill="#dbeafe" rx="6" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="105" y="105" text-anchor="middle" font-size="11" font-weight="600" fill="#1e3a8a">Smart Contracts</text>
+  <text x="105" y="122" text-anchor="middle" font-size="9.5" fill="#1d4ed8">(Soroban / XDR)</text>
+  <text x="105" y="139" text-anchor="middle" font-size="9" fill="#2563eb">contract event emission</text>
+
+  <line x1="105" y1="151" x2="105" y2="173" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#ah-blue)"/>
+
+  <rect x="25" y="175" width="160" height="68" fill="#dbeafe" rx="6" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="105" y="197" text-anchor="middle" font-size="11" font-weight="600" fill="#1e3a8a">Stellar RPC</text>
+  <text x="105" y="214" text-anchor="middle" font-size="9.5" fill="#1d4ed8">testnet / mainnet</text>
+  <text x="105" y="231" text-anchor="middle" font-size="9" fill="#2563eb">getEvents polling</text>
+
+  <!-- LANE 2 — Indexer Layer -->
+  <rect x="208" y="55" width="210" height="285" fill="#f0fdf4" rx="8" stroke="#86efac" stroke-width="1.5"/>
+  <text x="313" y="74" text-anchor="middle" font-size="10" font-weight="700" fill="#15803d" letter-spacing="0.8">INDEXER LAYER</text>
+
+  <!-- Stacked replica boxes -->
+  <rect x="228" y="108" width="172" height="84" fill="#bbf7d0" rx="5" stroke="#4ade80" stroke-width="1" opacity="0.75"/>
+  <rect x="223" y="96" width="172" height="84" fill="#bbf7d0" rx="5" stroke="#4ade80" stroke-width="1" opacity="0.88"/>
+  <rect x="218" y="83" width="172" height="84" fill="#86efac" rx="6" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="304" y="105" text-anchor="middle" font-size="11" font-weight="600" fill="#14532d">Indexer Service</text>
+  <text x="304" y="121" text-anchor="middle" font-size="9" fill="#166534">XDR Parser • Deduplication</text>
+  <text x="304" y="136" text-anchor="middle" font-size="9" fill="#166534">Bloom Filter • Lua Transforms</text>
+  <text x="304" y="151" text-anchor="middle" font-size="9" fill="#166534">Content Filter • Batch Write</text>
+  <text x="393" y="99" font-size="7.5" fill="#4ade80">replica 3</text>
+  <text x="388" y="111" font-size="7.5" fill="#22c55e">replica 2 ▸ active</text>
+
+  <!-- Advisory lock pill -->
+  <rect x="218" y="177" width="172" height="26" fill="#dcfce7" rx="5" stroke="#16a34a" stroke-width="1" stroke-dasharray="4,2.5"/>
+  <text x="304" y="194" text-anchor="middle" font-size="9" font-weight="600" fill="#15803d">pg_try_advisory_lock (exclusive)</text>
+
+  <rect x="218" y="213" width="172" height="62" fill="#bbf7d0" rx="6" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="304" y="233" text-anchor="middle" font-size="11" font-weight="600" fill="#14532d">In-Memory Cache</text>
+  <text x="304" y="249" text-anchor="middle" font-size="9" fill="#15803d">Moka • Contract Metadata</text>
+  <text x="304" y="264" text-anchor="middle" font-size="9" fill="#166534">Configurable TTL • ABI Cache</text>
+
+  <!-- LANE 3 — Data Layer -->
+  <rect x="426" y="55" width="190" height="285" fill="#fff7ed" rx="8" stroke="#fdba74" stroke-width="1.5"/>
+  <text x="521" y="74" text-anchor="middle" font-size="10" font-weight="700" fill="#c2410c" letter-spacing="0.8">DATA LAYER</text>
+
+  <rect x="441" y="83" width="160" height="197" fill="#fed7aa" rx="6" stroke="#f97316" stroke-width="1.5"/>
+  <text x="521" y="105" text-anchor="middle" font-size="11" font-weight="600" fill="#7c2d12">PostgreSQL</text>
+  <text x="521" y="120" text-anchor="middle" font-size="8.5" fill="#9a3412">Connection Pool (SQLx / PgBouncer)</text>
+  <rect x="452" y="128" width="138" height="19" fill="#ffedd5" rx="3"/>
+  <text x="521" y="141" text-anchor="middle" font-size="9" fill="#7c2d12">events</text>
+  <rect x="452" y="151" width="138" height="19" fill="#ffedd5" rx="3"/>
+  <text x="521" y="164" text-anchor="middle" font-size="9" fill="#7c2d12">subscriptions</text>
+  <rect x="452" y="174" width="138" height="19" fill="#ffedd5" rx="3"/>
+  <text x="521" y="187" text-anchor="middle" font-size="9" fill="#7c2d12">webhooks</text>
+  <rect x="452" y="197" width="138" height="19" fill="#ffedd5" rx="3"/>
+  <text x="521" y="210" text-anchor="middle" font-size="9" fill="#7c2d12">delivery_logs</text>
+  <rect x="452" y="220" width="138" height="19" fill="#ffedd5" rx="3"/>
+  <text x="521" y="233" text-anchor="middle" font-size="9" fill="#7c2d12">abi_cache</text>
+  <rect x="452" y="243" width="138" height="19" fill="#ffedd5" rx="3"/>
+  <text x="521" y="256" text-anchor="middle" font-size="9" fill="#7c2d12">ledger_hashes</text>
+  <rect x="452" y="266" width="138" height="8" fill="#fde68a" rx="2"/>
+
+  <!-- LANE 4 — API Layer -->
+  <rect x="624" y="55" width="190" height="285" fill="#f0fdfa" rx="8" stroke="#5eead4" stroke-width="1.5"/>
+  <text x="719" y="74" text-anchor="middle" font-size="10" font-weight="700" fill="#0f766e" letter-spacing="0.8">API LAYER</text>
+
+  <rect x="639" y="83" width="160" height="77" fill="#99f6e4" rx="6" stroke="#0d9488" stroke-width="1.5"/>
+  <text x="719" y="106" text-anchor="middle" font-size="11" font-weight="600" fill="#134e4a">REST API</text>
+  <text x="719" y="122" text-anchor="middle" font-size="9" fill="#0f766e">Axum • OpenAPI • JWT Auth</text>
+  <text x="719" y="137" text-anchor="middle" font-size="9" fill="#115e59">Pagination • Filtering • Rate Limit</text>
+  <text x="719" y="152" text-anchor="middle" font-size="9" fill="#115e59">GZIP • Per-tenant support</text>
+
+  <line x1="719" y1="160" x2="719" y2="173" stroke="#0d9488" stroke-width="1.2" stroke-dasharray="3,2" marker-end="url(#ah-teal)"/>
+
+  <rect x="639" y="175" width="160" height="68" fill="#99f6e4" rx="6" stroke="#0d9488" stroke-width="1.5"/>
+  <text x="719" y="198" text-anchor="middle" font-size="11" font-weight="600" fill="#134e4a">SSE Streaming</text>
+  <text x="719" y="215" text-anchor="middle" font-size="9" fill="#0f766e">Server-Sent Events</text>
+  <text x="719" y="230" text-anchor="middle" font-size="9" fill="#115e59">Keepalive • Real-time push</text>
+
+  <!-- LANE 5 — Clients (top) -->
+  <rect x="822" y="55" width="368" height="285" fill="#faf5ff" rx="8" stroke="#d8b4fe" stroke-width="1.5"/>
+  <text x="1006" y="74" text-anchor="middle" font-size="10" font-weight="700" fill="#7e22ce" letter-spacing="0.8">CLIENTS &amp; SDKS</text>
+
+  <rect x="837" y="83" width="155" height="90" fill="#e9d5ff" rx="6" stroke="#9333ea" stroke-width="1.5"/>
+  <text x="914" y="106" text-anchor="middle" font-size="11" font-weight="600" fill="#581c87">Client SDKs</text>
+  <text x="914" y="124" text-anchor="middle" font-size="9.5" fill="#6b21a8">Rust SDK</text>
+  <text x="914" y="140" text-anchor="middle" font-size="9.5" fill="#6b21a8">JavaScript / TypeScript SDK</text>
+  <text x="914" y="156" text-anchor="middle" font-size="9.5" fill="#6b21a8">Python SDK</text>
+  <text x="914" y="167" text-anchor="middle" font-size="8" fill="#9333ea">REST + SSE abstraction</text>
+
+  <rect x="837" y="185" width="155" height="68" fill="#e9d5ff" rx="6" stroke="#9333ea" stroke-width="1.5"/>
+  <text x="914" y="208" text-anchor="middle" font-size="11" font-weight="600" fill="#581c87">SSE Subscribers</text>
+  <text x="914" y="224" text-anchor="middle" font-size="9" fill="#6b21a8">Real-time event stream</text>
+  <text x="914" y="240" text-anchor="middle" font-size="9" fill="#7e22ce">Filter by contract / topic</text>
+
+  <!-- Postman / docs consumers (right sub-column, top section) -->
+  <rect x="1008" y="83" width="168" height="175" fill="#e9d5ff" rx="6" stroke="#9333ea" stroke-width="1.5"/>
+  <text x="1092" y="106" text-anchor="middle" font-size="11" font-weight="600" fill="#581c87">API Consumers</text>
+  <rect x="1018" y="115" width="148" height="22" fill="#d8b4fe" rx="3"/>
+  <text x="1092" y="130" text-anchor="middle" font-size="9.5" fill="#3b0764">Postman Collection</text>
+  <rect x="1018" y="142" width="148" height="22" fill="#d8b4fe" rx="3"/>
+  <text x="1092" y="157" text-anchor="middle" font-size="9.5" fill="#3b0764">VS Code Extension</text>
+  <rect x="1018" y="169" width="148" height="22" fill="#d8b4fe" rx="3"/>
+  <text x="1092" y="184" text-anchor="middle" font-size="9.5" fill="#3b0764">CLI (event inspection)</text>
+  <rect x="1018" y="196" width="148" height="22" fill="#d8b4fe" rx="3"/>
+  <text x="1092" y="211" text-anchor="middle" font-size="9.5" fill="#3b0764">OpenAPI / Swagger UI</text>
+  <rect x="1018" y="223" width="148" height="22" fill="#d8b4fe" rx="3"/>
+  <text x="1092" y="238" text-anchor="middle" font-size="9.5" fill="#3b0764">Code-gen Helpers</text>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- DIVIDER + BOTTOM FLOW: notification & webhook delivery         -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <line x1="10" y1="352" x2="1190" y2="352" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="6,4"/>
+  <text x="600" y="366" text-anchor="middle" font-size="9.5" fill="#94a3b8">Notification &amp; Webhook Delivery Flow</text>
+
+  <!-- Notification Engine (data lane, bottom) -->
+  <rect x="426" y="376" width="190" height="225" fill="#fff7ed" rx="8" stroke="#fdba74" stroke-width="1.5"/>
+  <text x="521" y="395" text-anchor="middle" font-size="10" font-weight="700" fill="#c2410c" letter-spacing="0.5">NOTIFICATION ENGINE</text>
+  <rect x="441" y="403" width="160" height="84" fill="#fed7aa" rx="6" stroke="#f97316" stroke-width="1.5"/>
+  <text x="521" y="424" text-anchor="middle" font-size="10.5" font-weight="600" fill="#7c2d12">Subscription Matcher</text>
+  <text x="521" y="440" text-anchor="middle" font-size="9" fill="#9a3412">Matches events to subscriptions</text>
+  <text x="521" y="455" text-anchor="middle" font-size="9" fill="#9a3412">Rate Limiting (per-webhook)</text>
+  <text x="521" y="470" text-anchor="middle" font-size="9" fill="#c2410c">Exponential Backoff • Retry</text>
+  <rect x="441" y="496" width="160" height="60" fill="#fed7aa" rx="6" stroke="#f97316" stroke-width="1.5"/>
+  <text x="521" y="515" text-anchor="middle" font-size="10.5" font-weight="600" fill="#7c2d12">Webhook Manager</text>
+  <text x="521" y="531" text-anchor="middle" font-size="9" fill="#9a3412">HMAC Signing (SHA-256)</text>
+  <text x="521" y="547" text-anchor="middle" font-size="9" fill="#c2410c">Delivery Log • Retry Queue</text>
+  <line x1="521" y1="487" x2="521" y2="494" stroke="#f97316" stroke-width="1.5" marker-end="url(#ah-orange)"/>
+
+  <!-- Notification Channels (right, bottom) -->
+  <rect x="624" y="376" width="566" height="225" fill="#faf5ff" rx="8" stroke="#d8b4fe" stroke-width="1.5"/>
+  <text x="907" y="395" text-anchor="middle" font-size="10" font-weight="700" fill="#7e22ce" letter-spacing="0.5">NOTIFICATION CHANNELS</text>
+
+  <!-- Row 1 channels -->
+  <rect x="639" y="403" width="118" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="698" y="424" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">Email</text>
+  <text x="698" y="441" text-anchor="middle" font-size="8.5" fill="#6b21a8">Lettre • SMTP • DKIM</text>
+
+  <rect x="769" y="403" width="118" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="828" y="424" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">SMS</text>
+  <text x="828" y="441" text-anchor="middle" font-size="8.5" fill="#6b21a8">Twilio</text>
+
+  <rect x="899" y="403" width="118" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="958" y="424" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">PagerDuty</text>
+  <text x="958" y="441" text-anchor="middle" font-size="8.5" fill="#6b21a8">On-call escalation</text>
+
+  <rect x="1029" y="403" width="147" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="1102" y="424" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">Webhooks (HTTP)</text>
+  <text x="1102" y="441" text-anchor="middle" font-size="8.5" fill="#6b21a8">Custom endpoints</text>
+
+  <!-- Row 2 channels -->
+  <rect x="639" y="467" width="118" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="698" y="488" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">AWS Kinesis</text>
+  <text x="698" y="505" text-anchor="middle" font-size="8.5" fill="#6b21a8">High-throughput stream</text>
+
+  <rect x="769" y="467" width="118" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="828" y="488" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">GCP Pub/Sub</text>
+  <text x="828" y="505" text-anchor="middle" font-size="8.5" fill="#6b21a8">Multi-region delivery</text>
+
+  <rect x="899" y="467" width="118" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="958" y="488" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">Kafka</text>
+  <text x="958" y="505" text-anchor="middle" font-size="8.5" fill="#6b21a8">Self-hosted deployments</text>
+
+  <rect x="1029" y="467" width="147" height="50" fill="#e9d5ff" rx="5" stroke="#9333ea" stroke-width="1.2"/>
+  <text x="1102" y="488" text-anchor="middle" font-size="10.5" font-weight="600" fill="#581c87">Slack</text>
+  <text x="1102" y="505" text-anchor="middle" font-size="8.5" fill="#6b21a8">Webhook-based alerts</text>
+
+  <!-- Row 3: delivery guarantees banner -->
+  <rect x="639" y="531" width="537" height="35" fill="#f3e8ff" rx="5" stroke="#d8b4fe" stroke-width="1"/>
+  <text x="907" y="546" text-anchor="middle" font-size="9" font-weight="600" fill="#581c87">Delivery Guarantees:</text>
+  <text x="907" y="559" text-anchor="middle" font-size="9" fill="#6b21a8">at-least-once  •  HMAC signature verification  •  unique event IDs (idempotency)  •  ledger sequence ordering</text>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- CROSS-LANE ARROWS                                              -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+
+  <!-- Stellar RPC → Indexer Service (curved, crossing lane boundary) -->
+  <path d="M 185,210 C 200,210 205,130 218,130" stroke="#3b82f6" stroke-width="2" fill="none" marker-end="url(#ah-blue)"/>
+  <text x="197" y="168" text-anchor="middle" font-size="8.5" fill="#2563eb">XDR</text>
+  <text x="197" y="180" text-anchor="middle" font-size="8.5" fill="#2563eb">Events</text>
+
+  <!-- Indexer → PostgreSQL -->
+  <path d="M 390,130 C 410,130 418,150 441,150" stroke="#16a34a" stroke-width="2" fill="none" marker-end="url(#ah-green)"/>
+  <text x="415" y="140" text-anchor="middle" font-size="8.5" fill="#15803d">index</text>
+
+  <!-- PostgreSQL → REST API -->
+  <path d="M 601,120 C 620,120 625,120 639,120" stroke="#ea580c" stroke-width="2" fill="none" marker-end="url(#ah-orange)"/>
+  <text x="620" y="112" text-anchor="middle" font-size="8" fill="#ea580c">query</text>
+
+  <!-- PostgreSQL → SSE (notify) -->
+  <path d="M 601,200 C 620,200 624,209 639,209" stroke="#ea580c" stroke-width="2" fill="none" marker-end="url(#ah-orange)"/>
+  <text x="621" y="198" text-anchor="middle" font-size="8" fill="#ea580c">notify</text>
+
+  <!-- REST API → Client SDKs -->
+  <path d="M 799,120 C 818,120 820,120 837,120" stroke="#0d9488" stroke-width="2" fill="none" marker-end="url(#ah-teal)"/>
+
+  <!-- SSE → SSE Subscribers -->
+  <path d="M 799,209 C 818,209 820,219 837,219" stroke="#0d9488" stroke-width="2" fill="none" marker-end="url(#ah-teal)"/>
+
+  <!-- PostgreSQL → Notification Engine (vertical, between top and bottom sections) -->
+  <path d="M 521,280 L 521,340 L 521,375" stroke="#ea580c" stroke-width="1.8" fill="none" stroke-dasharray="5,3" marker-end="url(#ah-orange)"/>
+  <text x="534" y="330" font-size="8.5" fill="#ea580c">subscription</text>
+  <text x="534" y="342" font-size="8.5" fill="#ea580c">match</text>
+
+  <!-- Notification Engine → Notification Channels -->
+  <path d="M 616,450 C 630,450 630,450 624,450" stroke="#ea580c" stroke-width="2" fill="none"/>
+  <line x1="616" y1="450" x2="622" y2="450" stroke="#ea580c" stroke-width="2" marker-end="url(#ah-orange)"/>
+
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <!-- LEGEND                                                         -->
+  <!-- ═══════════════════════════════════════════════════════════════ -->
+  <rect x="10" y="618" width="1180" height="72" fill="#f1f5f9" rx="8" stroke="#e2e8f0" stroke-width="1"/>
+
+  <!-- Arrow legend row -->
+  <text x="22" y="636" font-size="9.5" font-weight="700" fill="#475569">Flow:</text>
+  <line x1="60" y1="632" x2="95" y2="632" stroke="#3b82f6" stroke-width="2" marker-end="url(#ah-blue)"/>
+  <text x="100" y="636" font-size="9" fill="#475569">Stellar event flow</text>
+  <line x1="220" y1="632" x2="255" y2="632" stroke="#16a34a" stroke-width="2" marker-end="url(#ah-green)"/>
+  <text x="260" y="636" font-size="9" fill="#475569">Indexer → DB write</text>
+  <line x1="390" y1="632" x2="425" y2="632" stroke="#ea580c" stroke-width="2" marker-end="url(#ah-orange)"/>
+  <text x="430" y="636" font-size="9" fill="#475569">DB query / notification</text>
+  <line x1="580" y1="632" x2="615" y2="632" stroke="#0d9488" stroke-width="2" marker-end="url(#ah-teal)"/>
+  <text x="620" y="636" font-size="9" fill="#475569">API → client delivery</text>
+  <line x1="760" y1="632" x2="795" y2="632" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4,2.5" marker-end="url(#ah)"/>
+  <text x="800" y="636" font-size="9" fill="#475569">subscription match (async)</text>
+
+  <!-- Color key row -->
+  <text x="22" y="655" font-size="9.5" font-weight="700" fill="#475569">Layers:</text>
+  <rect x="62" y="645" width="11" height="11" fill="#dbeafe" rx="2" stroke="#3b82f6" stroke-width="1"/>
+  <text x="78" y="655" font-size="9" fill="#475569">Stellar Network</text>
+  <rect x="175" y="645" width="11" height="11" fill="#86efac" rx="2" stroke="#16a34a" stroke-width="1"/>
+  <text x="191" y="655" font-size="9" fill="#475569">Indexer</text>
+  <rect x="255" y="645" width="11" height="11" fill="#fed7aa" rx="2" stroke="#f97316" stroke-width="1"/>
+  <text x="271" y="655" font-size="9" fill="#475569">Data / PostgreSQL</text>
+  <rect x="375" y="645" width="11" height="11" fill="#99f6e4" rx="2" stroke="#0d9488" stroke-width="1"/>
+  <text x="391" y="655" font-size="9" fill="#475569">API Layer</text>
+  <rect x="455" y="645" width="11" height="11" fill="#e9d5ff" rx="2" stroke="#9333ea" stroke-width="1"/>
+  <text x="471" y="655" font-size="9" fill="#475569">Clients &amp; Integrations</text>
+  <rect x="600" y="645" width="11" height="11" fill="#dcfce7" rx="2" stroke="#16a34a" stroke-width="1" stroke-dasharray="3,2"/>
+  <text x="616" y="655" font-size="9" fill="#475569">Advisory Lock (dashed = pg_try_advisory_lock)</text>
+  <text x="870" y="655" font-size="9" fill="#94a3b8">github.com/Soroban-Pulse/SorobanPulse</text>
+</svg>

@@ -2,6 +2,12 @@
 
 This document provides a comprehensive overview of the SorobanPulse system architecture, including component interactions, data flow, and integration patterns.
 
+## Architecture Diagram
+
+![SorobanPulse System Architecture](architecture.svg)
+
+> The diagram above shows all major components, data flow paths, the multi-replica advisory lock mechanism, and the notification/webhook delivery flow. An SVG copy is available at [`docs/architecture.svg`](architecture.svg) for embedding in external tooling.
+
 ## System Architecture Overview
 
 SorobanPulse is a high-performance event indexing and notification system for the Stellar blockchain. It monitors smart contract events through the Stellar RPC, indexes them into a PostgreSQL database, and delivers real-time notifications to subscribers via multiple channels.
