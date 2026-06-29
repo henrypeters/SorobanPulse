@@ -25,10 +25,10 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     pub fn webhook_default() -> Self {
         Self {
-            max_attempts: 3,
+            max_attempts: 5,
             initial_backoff_ms: 1000,
             backoff_multiplier: 2.0,
-            max_backoff_ms: 8000,
+            max_backoff_ms: 600_000,
         }
     }
 
