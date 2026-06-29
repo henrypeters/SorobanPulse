@@ -392,6 +392,28 @@ pub struct Config {
     pub abi_cache_ttl_secs: u64,
     /// Maximum number of ABIs kept in the in-process cache.
     pub abi_cache_max_entries: u64,
+
+    // Issue #623: Event archival to cold storage
+    /// S3 bucket name for archived events. When set, the archiver is enabled.
+    pub archive_s3_bucket: Option<String>,
+    /// S3 key prefix for archived events (default "events").
+    pub archive_s3_prefix: String,
+    /// Age in days after which events are eligible for archival (default 30).
+    pub archive_after_days: u32,
+    /// Archive format: "ndjson" (default) or "parquet".
+    pub archive_format: String,
+
+    // Issue #624: Batch query optimization
+    /// Maximum number of tx hashes accepted by the batch tx endpoint (default 100).
+    pub batch_tx_max_size: usize,
+    /// Maximum number of events returned by the bulk batch endpoint (default 10_000).
+    pub batch_events_max_size: usize,
+
+    // Issue #626: Aggregation result cache
+    /// TTL in seconds for aggregation endpoint cache entries (default 60).
+    pub aggregation_cache_ttl_secs: u64,
+    /// Maximum number of entries in the aggregation result cache.
+    pub aggregation_cache_max_entries: u64,
 }
 
 impl Default for Config {
@@ -532,6 +554,14 @@ impl Default for Config {
             ledger_hash_validation_depth: 1_000,
             abi_cache_ttl_secs: crate::abi::DEFAULT_ABI_CACHE_TTL_SECS,
             abi_cache_max_entries: crate::abi::ABI_CACHE_MAX_ENTRIES,
+            archive_s3_bucket: None,
+            archive_s3_prefix: "events".to_string(),
+            archive_after_days: 30,
+            archive_format: "ndjson".to_string(),
+            batch_tx_max_size: 100,
+            batch_events_max_size: 10_000,
+            aggregation_cache_ttl_secs: 60,
+            aggregation_cache_max_entries: 1_000,
         }
     }
 }
@@ -1137,6 +1167,38 @@ impl Config {
         )
         .unwrap_or(30);
 
+        let batch_tx_max_size = parse_int::<usize>(
+            "BATCH_TX_MAX_SIZE",
+            &env_or_file_or("BATCH_TX_MAX_SIZE", &file, "100"),
+            "100",
+            &mut errors,
+        )
+        .unwrap_or(100);
+
+        let batch_events_max_size = parse_int::<usize>(
+            "BATCH_EVENTS_MAX_SIZE",
+            &env_or_file_or("BATCH_EVENTS_MAX_SIZE", &file, "10000"),
+            "10000",
+            &mut errors,
+        )
+        .unwrap_or(10_000);
+
+        let aggregation_cache_ttl_secs = parse_int::<u64>(
+            "AGGREGATION_CACHE_TTL_SECS",
+            &env_or_file_or("AGGREGATION_CACHE_TTL_SECS", &file, "60"),
+            "60",
+            &mut errors,
+        )
+        .unwrap_or(60);
+
+        let aggregation_cache_max_entries = parse_int::<u64>(
+            "AGGREGATION_CACHE_MAX_ENTRIES",
+            &env_or_file_or("AGGREGATION_CACHE_MAX_ENTRIES", &file, "1000"),
+            "1000",
+            &mut errors,
+        )
+        .unwrap_or(1_000);
+
         let event_data_encryption_key = env_or_file("EVENT_DATA_ENCRYPTION_KEY", &file)
             .and_then(|v| parse_hex_key_checked("EVENT_DATA_ENCRYPTION_KEY", &v, &mut errors));
 
@@ -1495,6 +1557,17 @@ impl Config {
             abi_cache_max_entries: env_or_file("ABI_CACHE_MAX_ENTRIES", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(crate::abi::ABI_CACHE_MAX_ENTRIES),
+            // Issue #623: Event archival
+            archive_s3_bucket: env_or_file("ARCHIVE_S3_BUCKET", &file).filter(|s| !s.is_empty()),
+            archive_s3_prefix: env_or_file_or("ARCHIVE_S3_PREFIX", &file, "events"),
+            archive_after_days,
+            archive_format: env_or_file_or("ARCHIVE_FORMAT", &file, "ndjson"),
+            // Issue #624: Batch query
+            batch_tx_max_size,
+            batch_events_max_size,
+            // Issue #626: Aggregation cache
+            aggregation_cache_ttl_secs,
+            aggregation_cache_max_entries,
         }
     }
 }

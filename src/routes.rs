@@ -98,6 +98,8 @@ pub struct AppState {
     pub super_admin_key_hash: Option<String>,
     /// Issue #607: In-process ABI cache (LRU-bounded, 24 h TTL by default).
     pub abi_cache: crate::abi::AbiCache,
+    /// Issue #626: Aggregation result cache (TTL and max-entries from config).
+    pub aggregation_cache: moka::future::Cache<String, serde_json::Value>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -139,6 +141,11 @@ pub struct AppState {
         handlers::pause_indexer,
         handlers::resume_indexer,
         handlers::list_archive,
+        handlers::query_archive,
+        handlers::restore_from_archive,
+        handlers::batch_query_events,
+        handlers::fulltext_search,
+        handlers::events_aggregations,
         handlers::register_contract_schema,
         handlers::get_contract_schema,
         handlers::delete_contract_schema,
@@ -334,6 +341,12 @@ pub fn create_router_with_tx_and_tenant_map(
         .time_to_live(std::time::Duration::from_secs(config.abi_cache_ttl_secs))
         .build();
 
+    // Issue #626: build the aggregation result cache from config.
+    let aggregation_cache = moka::future::Cache::builder()
+        .max_capacity(config.aggregation_cache_max_entries)
+        .time_to_live(std::time::Duration::from_secs(config.aggregation_cache_ttl_secs))
+        .build();
+
     let app_state = AppState {
         pool,
         read_pool,
@@ -356,6 +369,7 @@ pub fn create_router_with_tx_and_tenant_map(
         sse_connections_per_ip: Arc::new(DashMap::new()),
         super_admin_key_hash,
         abi_cache,
+        aggregation_cache,
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
@@ -474,7 +488,16 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/compression/stats", axum::routing::get(handlers::compression_stats))
         .route("/admin/compression/migrate", axum::routing::post(handlers::start_compression_migration))
         // Issue #607: Cached ABI endpoint
-        .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached));
+        .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached))
+        // Issue #623: Archive query and restore endpoints
+        .route("/archive/query", axum::routing::get(handlers::query_archive))
+        .route("/archive/restore", axum::routing::post(handlers::restore_from_archive))
+        // Issue #624: Bulk batch query endpoint
+        .route("/events/batch", axum::routing::post(handlers::batch_query_events))
+        // Issue #625: Full-text search endpoint
+        .route("/search", axum::routing::get(handlers::fulltext_search))
+        // Issue #626: Faceted aggregation endpoint
+        .route("/events/aggregations", axum::routing::get(handlers::events_aggregations));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)

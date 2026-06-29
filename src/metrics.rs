@@ -92,6 +92,32 @@ pub fn record_archive_integrity_failure() {
     m::counter!("soroban_pulse_archive_integrity_failures_total").increment(1);
 }
 
+/// Record an archive query (issue #623)
+pub fn record_archive_query() {
+    m::counter!("soroban_pulse_archive_queries_total").increment(1);
+}
+
+/// Record events restored from archive (issue #623)
+pub fn record_archive_restore(count: u64) {
+    m::counter!("soroban_pulse_archive_restored_events_total").increment(count);
+}
+
+/// Record a batch query and how many events it returned (issue #624)
+pub fn record_batch_query(event_count: u64) {
+    m::counter!("soroban_pulse_batch_queries_total").increment(1);
+    m::counter!("soroban_pulse_batch_query_events_total").increment(event_count);
+}
+
+/// Record a full-text search query (issue #625)
+pub fn record_fulltext_search() {
+    m::counter!("soroban_pulse_fulltext_searches_total").increment(1);
+}
+
+/// Record an aggregation query (issue #626)
+pub fn record_aggregation_query() {
+    m::counter!("soroban_pulse_aggregation_queries_total").increment(1);
+}
+
 /// Update re-encryption progress gauge (issue #372)
 pub fn update_reencrypt_progress(remaining: u64) {
     m::gauge!("soroban_pulse_reencrypt_progress").set(remaining as f64);

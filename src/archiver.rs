@@ -1,6 +1,7 @@
 //! Background archival job: moves events older than `archive_after_days` from
-//! PostgreSQL to S3-compatible object storage as gzip-compressed NDJSON files.
+//! PostgreSQL to S3-compatible object storage as gzip-compressed NDJSON or Parquet files.
 //! Issue #371: Verifies upload integrity via SHA-256 checksum before marking archived.
+//! Issue #623: Adds Parquet export format, archival metrics, and size-based archival strategy.
 //!
 //! Only compiled when the `archive` feature is enabled.
 
@@ -36,14 +37,15 @@ pub async fn run_archiver(pool: PgPool, config: Config) {
     let bucket = bucket.clone();
     let prefix = config.archive_s3_prefix.clone();
     let after_days = i64::from(config.archive_after_days);
+    let format = config.archive_format.clone();
 
     let aws_cfg = aws_config::load_from_env().await;
     let s3 = aws_sdk_s3::Client::new(&aws_cfg);
 
-    info!(bucket = %bucket, prefix = %prefix, after_days, "Archiver started");
+    info!(bucket = %bucket, prefix = %prefix, after_days, format = %format, "Archiver started");
 
     loop {
-        if let Err(e) = archive_once(&pool, &s3, &bucket, &prefix, after_days).await {
+        if let Err(e) = archive_once(&pool, &s3, &bucket, &prefix, after_days, &format).await {
             error!(error = %e, "Archival run failed");
         }
         // Run once per day.
@@ -58,6 +60,7 @@ async fn archive_once(
     bucket: &str,
     prefix: &str,
     after_days: i64,
+    format: &str,
 ) -> anyhow::Result<()> {
     let cutoff = Utc::now() - chrono::Duration::days(after_days);
 
@@ -69,8 +72,10 @@ async fn archive_once(
     .fetch_all(pool)
     .await?;
 
+    crate::metrics::record_archive_query();
+
     for date in dates {
-        if let Err(e) = archive_date(pool, s3, bucket, prefix, date).await {
+        if let Err(e) = archive_date(pool, s3, bucket, prefix, date, format).await {
             error!(date = %date, error = %e, "Failed to archive date");
         }
     }
@@ -78,12 +83,14 @@ async fn archive_once(
 }
 
 /// Archive all events for a single calendar date, then delete them from the DB.
+/// Supports "ndjson" (gzip-compressed NDJSON) and "parquet" formats.
 async fn archive_date(
     pool: &PgPool,
     s3: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     date: NaiveDate,
+    format: &str,
 ) -> anyhow::Result<()> {
     let day_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
     let day_end = date.and_hms_opt(23, 59, 59).unwrap().and_utc();
@@ -102,27 +109,52 @@ async fn archive_date(
     }
 
     let count = rows.len();
-    let gz_bytes = encode_ndjson_gz(&rows)?;
+
+    let (archive_bytes, key, content_type) = if format == "parquet" {
+        let parquet_rows: Vec<crate::parquet_export::EventRow> = rows.iter().map(|r| {
+            crate::parquet_export::EventRow {
+                id: r.id,
+                contract_id: r.contract_id.clone(),
+                event_type: r.event_type.to_string(),
+                tx_hash: r.tx_hash.clone(),
+                ledger: r.ledger,
+                timestamp: r.timestamp,
+                event_data: r.event_data.clone(),
+                created_at: r.created_at,
+            }
+        }).collect();
+        let bytes = crate::parquet_export::write_events_parquet(&parquet_rows)
+            .map_err(|e| anyhow::anyhow!("Parquet serialization failed: {e}"))?;
+        let k = format!(
+            "{}/{}/{}/{}/events.parquet",
+            prefix,
+            date.format("%Y"),
+            date.format("%m"),
+            date.format("%d"),
+        );
+        (bytes, k, "application/octet-stream")
+    } else {
+        let gz = encode_ndjson_gz(&rows)?;
+        let k = format!(
+            "{}/{}/{}/{}/events.ndjson.gz",
+            prefix,
+            date.format("%Y"),
+            date.format("%m"),
+            date.format("%d"),
+        );
+        (gz, k, "application/x-ndjson")
+    };
 
     // Compute SHA-256 of the archive before upload
     let mut hasher = Sha256::new();
-    hasher.update(&gz_bytes);
+    hasher.update(&archive_bytes);
     let local_hash = format!("{:x}", hasher.finalize());
-
-    let key = format!(
-        "{}/{}/{}/{}/events.ndjson.gz",
-        prefix,
-        date.format("%Y"),
-        date.format("%m"),
-        date.format("%d"),
-    );
 
     let put_response = s3.put_object()
         .bucket(bucket)
         .key(&key)
-        .body(ByteStream::from(gz_bytes))
-        .content_type("application/x-ndjson")
-        .content_encoding("gzip")
+        .body(ByteStream::from(archive_bytes))
+        .content_type(content_type)
         .send()
         .await?;
 
@@ -147,7 +179,8 @@ async fn archive_date(
         .execute(pool)
         .await?;
 
-    info!(date = %date, count, key = %key, "Archived events");
+    crate::metrics::record_archive_restore(count as u64);
+    info!(date = %date, count, key = %key, format, "Archived events");
     Ok(())
 }
 

@@ -11578,6 +11578,797 @@ pub async fn get_contract_abi_cached(
     }
 }
 
+// ============================================================================
+// Issue #623: Archive query and restore
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct ArchiveQueryParams {
+    /// Start date (YYYY-MM-DD).
+    pub from_date: Option<String>,
+    /// End date (YYYY-MM-DD).
+    pub to_date: Option<String>,
+    /// Filter by contract_id.
+    pub contract_id: Option<String>,
+    /// Maximum number of archive files to return (default 100, max 1000).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct RestoreFromArchiveRequest {
+    /// S3 key of the archive file to restore.
+    pub key: String,
+    /// When true, restored events replace existing rows with the same id (upsert).
+    #[serde(default)]
+    pub upsert: bool,
+}
+
+/// `GET /v1/archive/query` — query archived event files in cold storage.
+///
+/// Lists archive files filtered by date range and contract. Supports
+/// pagination via `limit`. Returns file keys that can be used with the
+/// restore endpoint.
+#[utoipa::path(
+    get,
+    path = "/v1/archive/query",
+    tag = "archive",
+    params(
+        ("from_date" = Option<String>, Query, description = "Start date YYYY-MM-DD"),
+        ("to_date" = Option<String>, Query, description = "End date YYYY-MM-DD"),
+        ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("limit" = Option<usize>, Query, description = "Max results (default 100, max 1000)"),
+    ),
+    responses(
+        (status = 200, description = "Archive files matching the query"),
+        (status = 501, description = "Archive feature not enabled"),
+    )
+)]
+pub async fn query_archive(
+    State(state): State<AppState>,
+    Query(params): Query<ArchiveQueryParams>,
+) -> Result<Json<Value>, AppError> {
+    #[cfg(feature = "archive")]
+    {
+        let (bucket, prefix) = match &state.config.archive_s3_bucket {
+            Some(b) => (b.clone(), state.config.archive_s3_prefix.clone()),
+            None => {
+                return Err(AppError::Validation(
+                    "ARCHIVE_S3_BUCKET is not configured".to_string(),
+                ))
+            }
+        };
+
+        let aws_cfg = aws_config::load_from_env().await;
+        let s3 = aws_sdk_s3::Client::new(&aws_cfg);
+
+        let mut files = crate::archiver::list_archive_files(&s3, &bucket, &prefix)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        // Filter by date range
+        if let Some(ref from_date) = params.from_date {
+            files.retain(|f| f.date.as_str() >= from_date.as_str());
+        }
+        if let Some(ref to_date) = params.to_date {
+            files.retain(|f| f.date.as_str() <= to_date.as_str());
+        }
+
+        // Filter by contract_id encoded in the key path when possible
+        if let Some(ref contract_id) = params.contract_id {
+            files.retain(|f| f.key.contains(contract_id.as_str()));
+        }
+
+        let limit = params.limit.unwrap_or(100).min(1000);
+        let total = files.len();
+        files.truncate(limit);
+
+        crate::metrics::record_archive_query();
+        Ok(Json(json!({
+            "data": files,
+            "total": total,
+            "returned": files.len(),
+        })))
+    }
+    #[cfg(not(feature = "archive"))]
+    {
+        let _ = (state, params);
+        Err(AppError::Internal("archive feature not enabled".to_string()))
+    }
+}
+
+/// `POST /v1/archive/restore` — restore events from an S3 archive file.
+///
+/// Downloads the specified archive file from S3, decompresses it, and
+/// re-inserts the events into the database. Supports upsert mode to
+/// overwrite existing rows.
+#[utoipa::path(
+    post,
+    path = "/v1/archive/restore",
+    tag = "archive",
+    request_body = RestoreFromArchiveRequest,
+    responses(
+        (status = 200, description = "Events restored successfully"),
+        (status = 400, description = "Invalid request"),
+        (status = 501, description = "Archive feature not enabled"),
+    )
+)]
+pub async fn restore_from_archive(
+    State(state): State<AppState>,
+    Json(body): Json<RestoreFromArchiveRequest>,
+) -> Result<Json<Value>, AppError> {
+    #[cfg(feature = "archive")]
+    {
+        use flate2::read::GzDecoder;
+        use std::io::{BufRead, BufReader};
+
+        if body.key.is_empty() {
+            return Err(AppError::Validation("key must not be empty".to_string()));
+        }
+
+        let (bucket, _prefix) = match &state.config.archive_s3_bucket {
+            Some(b) => (b.clone(), state.config.archive_s3_prefix.clone()),
+            None => {
+                return Err(AppError::Validation(
+                    "ARCHIVE_S3_BUCKET is not configured".to_string(),
+                ))
+            }
+        };
+
+        let aws_cfg = aws_config::load_from_env().await;
+        let s3 = aws_sdk_s3::Client::new(&aws_cfg);
+
+        let resp = s3
+            .get_object()
+            .bucket(&bucket)
+            .key(&body.key)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("S3 get_object failed: {e}")))?;
+
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to read S3 body: {e}")))?
+            .into_bytes();
+
+        let decoder = GzDecoder::new(bytes.as_ref());
+        let reader = BufReader::new(decoder);
+
+        let mut restored = 0usize;
+        let mut errors = 0usize;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) if l.trim().is_empty() => continue,
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read line from archive");
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            let event: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to parse event JSON from archive");
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            let id = event["id"].as_str().unwrap_or_default();
+            let contract_id = event["contract_id"].as_str().unwrap_or_default();
+            let event_type = event["event_type"].as_str().unwrap_or("contract");
+            let tx_hash = event["tx_hash"].as_str().unwrap_or_default();
+            let ledger = event["ledger"].as_i64().unwrap_or(0);
+            let timestamp = event["timestamp"].as_str().unwrap_or_default();
+            let event_data = &event["event_data"];
+
+            let result = if body.upsert {
+                sqlx::query(
+                    "INSERT INTO events (id, contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+                     VALUES ($1::uuid, $2, $3, $4, $5, $6::timestamptz, $7)
+                     ON CONFLICT (id) DO UPDATE SET
+                       contract_id = EXCLUDED.contract_id,
+                       event_type = EXCLUDED.event_type,
+                       tx_hash = EXCLUDED.tx_hash,
+                       ledger = EXCLUDED.ledger,
+                       timestamp = EXCLUDED.timestamp,
+                       event_data = EXCLUDED.event_data",
+                )
+            } else {
+                sqlx::query(
+                    "INSERT INTO events (id, contract_id, event_type, tx_hash, ledger, timestamp, event_data)
+                     VALUES ($1::uuid, $2, $3, $4, $5, $6::timestamptz, $7)
+                     ON CONFLICT (id) DO NOTHING",
+                )
+            }
+            .bind(id)
+            .bind(contract_id)
+            .bind(event_type)
+            .bind(tx_hash)
+            .bind(ledger)
+            .bind(timestamp)
+            .bind(event_data)
+            .execute(&state.pool)
+            .await;
+
+            match result {
+                Ok(_) => restored += 1,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to restore event from archive");
+                    errors += 1;
+                }
+            }
+        }
+
+        crate::metrics::record_archive_restore(restored as u64);
+        Ok(Json(json!({
+            "restored": restored,
+            "errors": errors,
+            "key": body.key,
+        })))
+    }
+    #[cfg(not(feature = "archive"))]
+    {
+        let _ = (state, body);
+        Err(AppError::Internal("archive feature not enabled".to_string()))
+    }
+}
+
+// ============================================================================
+// Issue #624: Bulk batch query with streaming
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct BatchEventFilter {
+    /// Filter by contract_id.
+    pub contract_id: Option<String>,
+    /// Filter by event type.
+    pub event_type: Option<String>,
+    /// Minimum ledger (inclusive).
+    pub from_ledger: Option<i64>,
+    /// Maximum ledger (inclusive).
+    pub to_ledger: Option<i64>,
+    /// Filter by tx_hash.
+    pub tx_hash: Option<String>,
+    /// Maximum events to return for this filter (max: 10_000).
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct BatchQueryRequest {
+    /// Array of filter objects to query in a single request.
+    pub filters: Vec<BatchEventFilter>,
+    /// Response format: "json" (default) or "csv".
+    #[serde(default = "default_batch_format")]
+    pub format: String,
+}
+
+fn default_batch_format() -> String {
+    "json".to_string()
+}
+
+/// `POST /v1/events/batch` — bulk event retrieval with multiple filters.
+///
+/// Accepts an array of filter objects and returns all matching events.
+/// Supports JSON and CSV output. Default max batch size is 10,000
+/// events total across all filters.
+#[utoipa::path(
+    post,
+    path = "/v1/events/batch",
+    tag = "events",
+    request_body = BatchQueryRequest,
+    responses(
+        (status = 200, description = "Batch query results"),
+        (status = 400, description = "Invalid request or exceeds max batch size"),
+    )
+)]
+pub async fn batch_query_events(
+    State(state): State<AppState>,
+    Json(body): Json<BatchQueryRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let max_total = state.config.batch_events_max_size as i64;
+
+    if body.filters.is_empty() {
+        return Err(AppError::Validation("filters array must not be empty".to_string()));
+    }
+    if body.filters.len() > 100 {
+        return Err(AppError::Validation(
+            "Maximum 100 filter objects per batch request".to_string(),
+        ));
+    }
+
+    let format = body.format.to_lowercase();
+    if format != "json" && format != "csv" {
+        return Err(AppError::Validation(
+            "format must be 'json' or 'csv'".to_string(),
+        ));
+    }
+
+    let mut all_events: Vec<Value> = Vec::new();
+    let job_id = Uuid::new_v4().to_string();
+    let all_cols: &[&str] = &["id", "contract_id", "event_type", "tx_hash", "ledger", "timestamp", "event_data", "created_at"];
+
+    for filter in &body.filters {
+        let remaining = max_total - all_events.len() as i64;
+        if remaining <= 0 {
+            break;
+        }
+        let limit = filter.limit.unwrap_or(1000).min(remaining).min(10_000);
+
+        // Build query with optional string/i64 bind parameters
+        let contract_id = filter.contract_id.clone();
+        let event_type = filter.event_type.clone();
+        let from_ledger = filter.from_ledger;
+        let to_ledger = filter.to_ledger;
+        let tx_hash = filter.tx_hash.clone();
+
+        let mut sql = String::from(
+            "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at \
+             FROM events WHERE 1=1",
+        );
+        let mut bind_idx = 1i32;
+
+        if contract_id.is_some() {
+            sql.push_str(&format!(" AND contract_id = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if event_type.is_some() {
+            sql.push_str(&format!(" AND event_type = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if from_ledger.is_some() {
+            sql.push_str(&format!(" AND ledger >= ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if to_ledger.is_some() {
+            sql.push_str(&format!(" AND ledger <= ${bind_idx}"));
+            bind_idx += 1;
+        }
+        if tx_hash.is_some() {
+            sql.push_str(&format!(" AND tx_hash = ${bind_idx}"));
+            bind_idx += 1;
+        }
+        let _ = bind_idx;
+
+        sql.push_str(" ORDER BY ledger DESC, id DESC");
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut query = sqlx::query(&sql);
+        if let Some(ref v) = contract_id { query = query.bind(v); }
+        if let Some(ref v) = event_type { query = query.bind(v); }
+        if let Some(v) = from_ledger { query = query.bind(v); }
+        if let Some(v) = to_ledger { query = query.bind(v); }
+        if let Some(ref v) = tx_hash { query = query.bind(v); }
+
+        let rows = query
+            .fetch_all(&state.read_pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Batch query failed: {e}")))?;
+
+        let events = rows_to_json(
+            &rows,
+            all_cols,
+            state.encryption_key.as_ref(),
+            state.encryption_key_old.as_ref(),
+            false,
+        )?;
+        all_events.extend(events);
+    }
+
+    crate::metrics::record_batch_query(all_events.len() as u64);
+
+    if format == "csv" {
+        let mut csv = String::from("id,contract_id,event_type,tx_hash,ledger,timestamp\n");
+        for ev in &all_events {
+            let id = ev["id"].as_str().unwrap_or("");
+            let cid = ev["contract_id"].as_str().unwrap_or("");
+            let et = ev["event_type"].as_str().unwrap_or("");
+            let th = ev["tx_hash"].as_str().unwrap_or("");
+            let ledger = ev["ledger"].as_i64().unwrap_or(0);
+            let ts = ev["timestamp"].as_str().unwrap_or("");
+            csv.push_str(&format!("{id},{cid},{et},{th},{ledger},{ts}\n"));
+        }
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/csv")
+            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"batch_{job_id}.csv\""))
+            .body(Body::from(csv))
+            .unwrap()
+            .into_response());
+    }
+
+    Ok(Json(json!({
+        "job_id": job_id,
+        "total": all_events.len(),
+        "data": all_events,
+    })).into_response())
+}
+
+// ============================================================================
+// Issue #625: Full-text search endpoint
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct FulltextSearchParams {
+    /// Full-text search query (PostgreSQL plainto_tsquery format).
+    pub q: String,
+    /// Filter by contract_id.
+    pub contract_id: Option<String>,
+    /// Filter by event type.
+    pub event_type: Option<String>,
+    /// Minimum ledger.
+    pub from_ledger: Option<i64>,
+    /// Maximum ledger.
+    pub to_ledger: Option<i64>,
+    /// Maximum results (default 50, max 500).
+    pub limit: Option<i64>,
+    /// Offset for pagination.
+    pub offset: Option<i64>,
+    /// When true, results are sorted by relevance rank (default true).
+    #[serde(default = "default_rank")]
+    pub rank: bool,
+}
+
+fn default_rank() -> bool {
+    true
+}
+
+/// `GET /v1/search` — full-text search on event data.
+///
+/// Searches the `event_data_tsv` tsvector column using PostgreSQL
+/// `plainto_tsquery`. Results are ranked by relevance by default.
+/// Requires the migration `20260429000000_event_data_fulltext_search.sql`.
+#[utoipa::path(
+    get,
+    path = "/v1/search",
+    tag = "search",
+    params(
+        ("q" = String, Query, description = "Full-text query (plain text, supports AND/OR/NOT)"),
+        ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("event_type" = Option<String>, Query, description = "Filter by event type"),
+        ("from_ledger" = Option<i64>, Query, description = "Minimum ledger"),
+        ("to_ledger" = Option<i64>, Query, description = "Maximum ledger"),
+        ("limit" = Option<i64>, Query, description = "Max results (default 50, max 500)"),
+        ("offset" = Option<i64>, Query, description = "Pagination offset"),
+        ("rank" = Option<bool>, Query, description = "Sort by relevance (default true)"),
+    ),
+    responses(
+        (status = 200, description = "Full-text search results with relevance scores"),
+        (status = 400, description = "Invalid query"),
+    )
+)]
+pub async fn fulltext_search(
+    State(state): State<AppState>,
+    Query(params): Query<FulltextSearchParams>,
+) -> Result<Json<Value>, AppError> {
+    let q = params.q.trim();
+    if q.is_empty() {
+        return Err(AppError::Validation("q parameter must not be empty".to_string()));
+    }
+    if q.len() > 1000 {
+        return Err(AppError::Validation(
+            "q parameter exceeds maximum length of 1000 characters".to_string(),
+        ));
+    }
+
+    let limit = params.limit.unwrap_or(50).max(1).min(500);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let order_clause = if params.rank {
+        "ORDER BY ts_rank(event_data_tsv, plainto_tsquery('english', $1)) DESC, ledger DESC"
+    } else {
+        "ORDER BY ledger DESC, id DESC"
+    };
+
+    let mut sql = format!(
+        "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, \
+         ts_rank(event_data_tsv, plainto_tsquery('english', $1)) AS rank \
+         FROM events \
+         WHERE event_data_tsv @@ plainto_tsquery('english', $1)"
+    );
+
+    let mut bind_idx = 2i32;
+    let mut bind_contract_id: Option<String> = None;
+    let mut bind_event_type: Option<String> = None;
+    let mut bind_from: Option<i64> = None;
+    let mut bind_to: Option<i64> = None;
+
+    if let Some(ref cid) = params.contract_id {
+        sql.push_str(&format!(" AND contract_id = ${bind_idx}"));
+        bind_contract_id = Some(cid.clone());
+        bind_idx += 1;
+    }
+    if let Some(ref et) = params.event_type {
+        sql.push_str(&format!(" AND event_type = ${bind_idx}"));
+        bind_event_type = Some(et.clone());
+        bind_idx += 1;
+    }
+    if let Some(from) = params.from_ledger {
+        sql.push_str(&format!(" AND ledger >= ${bind_idx}"));
+        bind_from = Some(from);
+        bind_idx += 1;
+    }
+    if let Some(to) = params.to_ledger {
+        sql.push_str(&format!(" AND ledger <= ${bind_idx}"));
+        bind_to = Some(to);
+        bind_idx += 1;
+    }
+    let _ = bind_idx;
+
+    sql.push_str(&format!(" {order_clause} LIMIT {limit} OFFSET {offset}"));
+
+    let mut query = sqlx::query(&sql).bind(q);
+    if let Some(ref v) = bind_contract_id { query = query.bind(v); }
+    if let Some(ref v) = bind_event_type { query = query.bind(v); }
+    if let Some(v) = bind_from { query = query.bind(v); }
+    if let Some(v) = bind_to { query = query.bind(v); }
+
+    let rows = query
+        .fetch_all(&state.read_pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Full-text search query failed: {e}")))?;
+
+    let mut results: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: uuid::Uuid = row.try_get("id")?;
+        let contract_id: String = row.try_get("contract_id")?;
+        let event_type: String = row.try_get("event_type")?;
+        let tx_hash: String = row.try_get("tx_hash")?;
+        let ledger: i64 = row.try_get("ledger")?;
+        let timestamp: chrono::DateTime<Utc> = row.try_get("timestamp")?;
+        let event_data: Value = row.try_get("event_data")?;
+        let rank: f32 = row.try_get("rank").unwrap_or(0.0f32);
+
+        results.push(json!({
+            "id": id.to_string(),
+            "contract_id": contract_id,
+            "event_type": event_type,
+            "tx_hash": tx_hash,
+            "ledger": ledger,
+            "timestamp": timestamp.to_rfc3339(),
+            "event_data": event_data,
+            "relevance": rank,
+        }));
+    }
+
+    crate::metrics::record_fulltext_search();
+
+    Ok(Json(json!({
+        "query": q,
+        "total": results.len(),
+        "limit": limit,
+        "offset": offset,
+        "data": results,
+    })))
+}
+
+// ============================================================================
+// Issue #626: Faceted search / aggregation API
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct EventsAggregationParams {
+    /// Filter by contract_id.
+    pub contract_id: Option<String>,
+    /// Filter by event type.
+    pub event_type: Option<String>,
+    /// Minimum ledger.
+    pub from_ledger: Option<i64>,
+    /// Maximum ledger.
+    pub to_ledger: Option<i64>,
+    /// Time bucket: "hourly", "daily" (default), or "weekly".
+    #[serde(default = "default_time_bucket")]
+    pub time_bucket: String,
+    /// Maximum buckets per aggregation dimension (default 100, max 500).
+    pub limit: Option<i64>,
+}
+
+fn default_time_bucket() -> String {
+    "daily".to_string()
+}
+
+/// `GET /v1/events/aggregations` — faceted event statistics.
+///
+/// Returns event_type distribution, top contract_ids by event count,
+/// time-series bucketed counts, and topic distribution. Results are cached
+/// per unique parameter set for `AGGREGATION_CACHE_TTL_SECS` seconds.
+#[utoipa::path(
+    get,
+    path = "/v1/events/aggregations",
+    tag = "aggregations",
+    params(
+        ("contract_id" = Option<String>, Query, description = "Filter by contract ID"),
+        ("event_type" = Option<String>, Query, description = "Filter by event type"),
+        ("from_ledger" = Option<i64>, Query, description = "Minimum ledger"),
+        ("to_ledger" = Option<i64>, Query, description = "Maximum ledger"),
+        ("time_bucket" = Option<String>, Query, description = "Time bucket: hourly, daily (default), weekly"),
+        ("limit" = Option<i64>, Query, description = "Max buckets per dimension (default 100, max 500)"),
+    ),
+    responses(
+        (status = 200, description = "Aggregated event statistics"),
+        (status = 400, description = "Invalid parameters"),
+    )
+)]
+pub async fn events_aggregations(
+    State(state): State<AppState>,
+    Query(params): Query<EventsAggregationParams>,
+) -> Result<Json<Value>, AppError> {
+    let time_bucket = params.time_bucket.to_lowercase();
+    if !["hourly", "daily", "weekly"].contains(&time_bucket.as_str()) {
+        return Err(AppError::Validation(
+            "time_bucket must be 'hourly', 'daily', or 'weekly'".to_string(),
+        ));
+    }
+
+    let limit = params.limit.unwrap_or(100).max(1).min(500);
+
+    // Build a stable cache key from the request params
+    let cache_key = format!(
+        "agg:{}:{}:{}:{}:{}:{}",
+        params.contract_id.as_deref().unwrap_or(""),
+        params.event_type.as_deref().unwrap_or(""),
+        params.from_ledger.unwrap_or(0),
+        params.to_ledger.unwrap_or(0),
+        time_bucket,
+        limit,
+    );
+
+    if let Some(cached) = state.aggregation_cache.get(&cache_key).await {
+        return Ok(Json(cached));
+    }
+
+    // Build WHERE clause parts
+    let mut where_parts: Vec<String> = vec!["1=1".to_string()];
+    let mut bind_idx = 1i32;
+    let mut contract_id_bind: Option<String> = None;
+    let mut event_type_bind: Option<String> = None;
+    let mut from_ledger_bind: Option<i64> = None;
+    let mut to_ledger_bind: Option<i64> = None;
+
+    if let Some(ref cid) = params.contract_id {
+        where_parts.push(format!("contract_id = ${bind_idx}"));
+        contract_id_bind = Some(cid.clone());
+        bind_idx += 1;
+    }
+    if let Some(ref et) = params.event_type {
+        where_parts.push(format!("event_type = ${bind_idx}"));
+        event_type_bind = Some(et.clone());
+        bind_idx += 1;
+    }
+    if let Some(from) = params.from_ledger {
+        where_parts.push(format!("ledger >= ${bind_idx}"));
+        from_ledger_bind = Some(from);
+        bind_idx += 1;
+    }
+    if let Some(to) = params.to_ledger {
+        where_parts.push(format!("ledger <= ${bind_idx}"));
+        to_ledger_bind = Some(to);
+        bind_idx += 1;
+    }
+    let _ = bind_idx;
+    let where_clause = where_parts.join(" AND ");
+
+    macro_rules! bind_filters {
+        ($q:expr) => {{
+            let mut q = $q;
+            if let Some(ref v) = contract_id_bind { q = q.bind(v); }
+            if let Some(ref v) = event_type_bind { q = q.bind(v); }
+            if let Some(v) = from_ledger_bind { q = q.bind(v); }
+            if let Some(v) = to_ledger_bind { q = q.bind(v); }
+            q
+        }};
+    }
+
+    // 1. event_type aggregation
+    let event_type_sql = format!(
+        "SELECT event_type, COUNT(*) AS count FROM events WHERE {where_clause} \
+         GROUP BY event_type ORDER BY count DESC LIMIT {limit}"
+    );
+    let event_type_rows = bind_filters!(sqlx::query(&event_type_sql))
+        .fetch_all(&state.read_pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("event_type aggregation failed: {e}")))?;
+
+    let event_type_agg: Vec<Value> = event_type_rows
+        .iter()
+        .map(|r| {
+            let et: String = r.try_get("event_type").unwrap_or_default();
+            let count: i64 = r.try_get("count").unwrap_or(0);
+            json!({"event_type": et, "count": count})
+        })
+        .collect();
+
+    // 2. contract_id aggregation
+    let contract_id_sql = format!(
+        "SELECT contract_id, COUNT(*) AS count FROM events WHERE {where_clause} \
+         GROUP BY contract_id ORDER BY count DESC LIMIT {limit}"
+    );
+    let contract_id_rows = bind_filters!(sqlx::query(&contract_id_sql))
+        .fetch_all(&state.read_pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("contract_id aggregation failed: {e}")))?;
+
+    let contract_id_agg: Vec<Value> = contract_id_rows
+        .iter()
+        .map(|r| {
+            let cid: String = r.try_get("contract_id").unwrap_or_default();
+            let count: i64 = r.try_get("count").unwrap_or(0);
+            json!({"contract_id": cid, "count": count})
+        })
+        .collect();
+
+    // 3. Time-based aggregation
+    let trunc_fn = match time_bucket.as_str() {
+        "hourly" => "hour",
+        "weekly" => "week",
+        _ => "day",
+    };
+    let time_sql = format!(
+        "SELECT date_trunc('{trunc_fn}', timestamp) AS bucket, COUNT(*) AS count \
+         FROM events WHERE {where_clause} \
+         GROUP BY bucket ORDER BY bucket DESC LIMIT {limit}"
+    );
+    let time_rows = bind_filters!(sqlx::query(&time_sql))
+        .fetch_all(&state.read_pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("time aggregation failed: {e}")))?;
+
+    let time_agg: Vec<Value> = time_rows
+        .iter()
+        .map(|r| {
+            let bucket: Option<chrono::DateTime<Utc>> = r.try_get("bucket").ok();
+            let count: i64 = r.try_get("count").unwrap_or(0);
+            let bucket_str = bucket.map(|b| b.to_rfc3339()).unwrap_or_default();
+            json!({"bucket": bucket_str, "count": count})
+        })
+        .collect();
+
+    // 4. Topic aggregation (top topics from event_data->>'topic')
+    let topic_sql = format!(
+        "SELECT event_data->>'topic' AS topic, COUNT(*) AS count \
+         FROM events WHERE {where_clause} AND event_data->>'topic' IS NOT NULL \
+         GROUP BY topic ORDER BY count DESC LIMIT {limit}"
+    );
+    let topic_rows = bind_filters!(sqlx::query(&topic_sql))
+        .fetch_all(&state.read_pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("topic aggregation failed: {e}")))?;
+
+    let topic_agg: Vec<Value> = topic_rows
+        .iter()
+        .map(|r| {
+            let topic: String = r.try_get("topic").unwrap_or_default();
+            let count: i64 = r.try_get("count").unwrap_or(0);
+            json!({"topic": topic, "count": count})
+        })
+        .collect();
+
+    let result = json!({
+        "time_bucket": time_bucket,
+        "filters": {
+            "contract_id": params.contract_id,
+            "event_type": params.event_type,
+            "from_ledger": params.from_ledger,
+            "to_ledger": params.to_ledger,
+        },
+        "aggregations": {
+            "by_event_type": event_type_agg,
+            "by_contract_id": contract_id_agg,
+            "by_time": time_agg,
+            "by_topic": topic_agg,
+        },
+    });
+
+    state.aggregation_cache.insert(cache_key, result.clone()).await;
+    crate::metrics::record_aggregation_query();
+
+    Ok(Json(result))
+}
+
 #[cfg(test)]
 mod temporal_tests {
     use super::*;
