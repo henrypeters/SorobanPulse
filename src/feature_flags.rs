@@ -1,9 +1,19 @@
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 const DEFAULT_ERROR_RATE_WINDOW_SECS: u64 = 300;
 const DEFAULT_ROLLBACK_THRESHOLD: f64 = 0.05;
+
+/// Feature flag context for evaluation
+#[derive(Clone, Debug)]
+pub struct FeatureFlagContext {
+    pub contract_id: Option<String>,
+    pub user_id: Option<String>,
+    pub ip_address: Option<String>,
+    pub region: Option<String>,
+}
 
 pub struct FeatureFlagWatcher {
     pool: PgPool,
@@ -105,6 +115,96 @@ impl FeatureFlagWatcher {
     }
 }
 
+/// Evaluate whether a feature flag should be enabled for a given context
+pub async fn is_feature_enabled(
+    pool: &PgPool,
+    flag_name: &str,
+    context: &FeatureFlagContext,
+) -> Result<bool, sqlx::Error> {
+    let row: Option<(bool, i32, Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)> =
+        sqlx::query_as(
+            "SELECT enabled, rollout_percentage, target_contract_ids, target_user_ids, target_ips, target_regions
+             FROM feature_flags WHERE name = $1",
+        )
+        .bind(flag_name)
+        .fetch_optional(pool)
+        .await?;
+
+    match row {
+        None => Ok(false), // Feature flag doesn't exist
+        Some((false, _, _, _, _, _)) => Ok(false), // Feature flag is disabled globally
+        Some((true, rollout_pct, target_contracts, target_users, target_ips, target_regions)) => {
+            // Check targeting: if any targeting rules are set, require a match
+            let has_targeting = target_contracts.is_some() || target_users.is_some() || target_ips.is_some() || target_regions.is_some();
+            
+            if has_targeting {
+                let mut target_matched = false;
+
+                if let Some(ref contracts) = target_contracts {
+                    if let Some(ref contract_id) = context.contract_id {
+                        if contracts.contains(contract_id) {
+                            target_matched = true;
+                        }
+                    }
+                }
+
+                if let Some(ref users) = target_users {
+                    if let Some(ref user_id) = context.user_id {
+                        if users.contains(user_id) {
+                            target_matched = true;
+                        }
+                    }
+                }
+
+                if let Some(ref ips) = target_ips {
+                    if let Some(ref ip) = context.ip_address {
+                        if ips.contains(ip) {
+                            target_matched = true;
+                        }
+                    }
+                }
+
+                if let Some(ref regions) = target_regions {
+                    if let Some(ref region) = context.region {
+                        if regions.contains(region) {
+                            target_matched = true;
+                        }
+                    }
+                }
+
+                if !target_matched {
+                    return Ok(false);
+                }
+            }
+
+            // Check percentage-based rollout
+            let hash = compute_rollout_hash(flag_name, context);
+            let bucket = (hash % 100) as i32;
+            Ok(bucket < rollout_pct)
+        }
+    }
+}
+
+/// Compute a deterministic hash for percentage-based rollout
+fn compute_rollout_hash(flag_name: &str, context: &FeatureFlagContext) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    flag_name.hash(&mut hasher);
+
+    // Use contract ID as the primary targeting identifier for rollout consistency
+    if let Some(ref contract_id) = context.contract_id {
+        contract_id.hash(&mut hasher);
+    } else if let Some(ref user_id) = context.user_id {
+        user_id.hash(&mut hasher);
+    } else if let Some(ref ip) = context.ip_address {
+        ip.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
 pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<bool>) {
     tokio::spawn(async move {
         let watcher = FeatureFlagWatcher::new(pool);
@@ -153,5 +253,57 @@ mod tests {
         let total: i64 = 100;
         let rate = errors as f64 / total as f64;
         assert!((rate - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rollout_hash_consistent() {
+        let context = FeatureFlagContext {
+            contract_id: Some("CABC123".to_string()),
+            user_id: None,
+            ip_address: None,
+            region: None,
+        };
+        let hash1 = compute_rollout_hash("my-flag", &context);
+        let hash2 = compute_rollout_hash("my-flag", &context);
+        assert_eq!(hash1, hash2, "Hash should be deterministic");
+    }
+
+    #[test]
+    fn rollout_hash_differs_by_flag() {
+        let context = FeatureFlagContext {
+            contract_id: Some("CABC123".to_string()),
+            user_id: None,
+            ip_address: None,
+            region: None,
+        };
+        let hash1 = compute_rollout_hash("flag-a", &context);
+        let hash2 = compute_rollout_hash("flag-b", &context);
+        assert_ne!(hash1, hash2, "Hash should differ by flag name");
+    }
+
+    #[test]
+    fn rollout_percentage_distribution() {
+        // Verify that the rollout hash distribution is roughly uniform
+        let mut context = FeatureFlagContext {
+            contract_id: Some("contract-1".to_string()),
+            user_id: None,
+            ip_address: None,
+            region: None,
+        };
+
+        let mut enabled_count = 0;
+        let total = 1000;
+        for i in 0..total {
+            context.contract_id = Some(format!("contract-{}", i));
+            let hash = compute_rollout_hash("test-flag", &context);
+            let bucket = (hash % 100) as i32;
+            if bucket < 50 { // 50% rollout
+                enabled_count += 1;
+            }
+        }
+
+        // Should be close to 50% (allow 10% variance)
+        let ratio = enabled_count as f64 / total as f64;
+        assert!(ratio > 0.4 && ratio < 0.6, "Rollout distribution should be ~50%, got {}", ratio);
     }
 }

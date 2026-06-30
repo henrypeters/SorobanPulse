@@ -499,7 +499,9 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/compression/stats", axum::routing::get(handlers::compression_stats))
         .route("/admin/compression/migrate", axum::routing::post(handlers::start_compression_migration))
         // Issue #607: Cached ABI endpoint
-        .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached));
+        .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached))
+        // Issue #632: Feature flag client-side endpoint
+        .route("/features", axum::routing::get(handlers::get_feature_flag_status));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)

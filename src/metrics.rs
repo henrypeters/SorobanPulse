@@ -560,6 +560,43 @@ pub fn record_matview_staleness_seconds(view: &str, age_secs: f64) {
     .set(age_secs);
 }
 
+// ── Issue #630: Resource utilization metrics ────────────────────────────────
+
+/// Update file descriptor count gauge
+pub fn update_fd_count(count: u64) {
+    m::gauge!("soroban_pulse_fd_count").set(count as f64);
+}
+
+/// Update disk I/O read bytes gauge
+pub fn update_disk_read_bytes(bytes: u64) {
+    m::gauge!("soroban_pulse_disk_read_bytes_total").set(bytes as f64);
+}
+
+/// Update disk I/O write bytes gauge
+pub fn update_disk_write_bytes(bytes: u64) {
+    m::gauge!("soroban_pulse_disk_write_bytes_total").set(bytes as f64);
+}
+
+/// Update disk read syscall count gauge
+pub fn update_disk_syscalls_read(count: u64) {
+    m::gauge!("soroban_pulse_disk_syscalls_read_total").set(count as f64);
+}
+
+/// Update disk write syscall count gauge
+pub fn update_disk_syscalls_write(count: u64) {
+    m::gauge!("soroban_pulse_disk_syscalls_write_total").set(count as f64);
+}
+
+/// Update process memory RSS gauge
+pub fn update_memory_rss_bytes(bytes: u64) {
+    m::gauge!("soroban_pulse_process_memory_rss_bytes").set(bytes as f64);
+}
+
+/// Update process memory VMS gauge
+pub fn update_memory_vms_bytes(bytes: u64) {
+    m::gauge!("soroban_pulse_process_memory_vms_bytes").set(bytes as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
