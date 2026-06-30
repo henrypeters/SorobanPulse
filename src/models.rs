@@ -791,6 +791,9 @@ pub struct GetEventsResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SorobanEvent {
+    /// Stable SSE event ID assigned by the ring buffer (not persisted to DB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
     #[serde(rename = "contractId")]
     pub contract_id: String,
     #[serde(rename = "type")]

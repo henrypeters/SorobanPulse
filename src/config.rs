@@ -392,6 +392,17 @@ pub struct Config {
     pub abi_cache_ttl_secs: u64,
     /// Maximum number of ABIs kept in the in-process cache.
     pub abi_cache_max_entries: u64,
+
+    // SSE reconnection ring buffer
+    /// Maximum number of events stored in the in-memory SSE replay ring buffer.
+    /// When full the oldest event is evicted. Default: 10 000.
+    pub sse_ring_buffer_capacity: usize,
+
+    // Query result cache (materialized-view backed queries)
+    /// TTL in seconds for cached query results. Clamped to [300, 3600].
+    pub query_cache_ttl_secs: u64,
+    /// Maximum number of cached query results.
+    pub query_cache_max_capacity: u64,
 }
 
 impl Default for Config {
@@ -532,6 +543,9 @@ impl Default for Config {
             ledger_hash_validation_depth: 1_000,
             abi_cache_ttl_secs: crate::abi::DEFAULT_ABI_CACHE_TTL_SECS,
             abi_cache_max_entries: crate::abi::ABI_CACHE_MAX_ENTRIES,
+            sse_ring_buffer_capacity: crate::sse_ring_buffer::DEFAULT_RING_BUFFER_CAPACITY,
+            query_cache_ttl_secs: crate::query_cache::DEFAULT_TTL_SECS,
+            query_cache_max_capacity: crate::query_cache::DEFAULT_MAX_CAPACITY,
         }
     }
 }
@@ -1495,6 +1509,17 @@ impl Config {
             abi_cache_max_entries: env_or_file("ABI_CACHE_MAX_ENTRIES", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(crate::abi::ABI_CACHE_MAX_ENTRIES),
+            // SSE reconnection ring buffer
+            sse_ring_buffer_capacity: env_or_file("SSE_RING_BUFFER_CAPACITY", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::sse_ring_buffer::DEFAULT_RING_BUFFER_CAPACITY),
+            // Query result cache
+            query_cache_ttl_secs: env_or_file("QUERY_CACHE_TTL_SECS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::query_cache::DEFAULT_TTL_SECS),
+            query_cache_max_capacity: env_or_file("QUERY_CACHE_MAX_CAPACITY", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::query_cache::DEFAULT_MAX_CAPACITY),
         }
     }
 }
