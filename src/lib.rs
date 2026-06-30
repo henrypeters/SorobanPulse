@@ -15,6 +15,7 @@ pub mod encryption;
 pub mod error;
 pub mod graceful_shutdown;
 pub mod handlers;
+pub mod health_check;
 pub mod indexer;
 pub mod kinesis;
 #[cfg(feature = "lua")]
