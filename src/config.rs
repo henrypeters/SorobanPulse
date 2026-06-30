@@ -72,6 +72,8 @@ pub struct IndexerState {
     /// True when the indexer loop has been paused via the admin API.
     pub is_paused: AtomicBool,
     started_at: u64,
+    /// Issue #627: Bloom filter for quick contract existence check
+    pub bloom_filter: Option<Arc<crate::bloom_filter::EventBloomFilter>>,
 }
 
 impl IndexerState {
@@ -86,7 +88,13 @@ impl IndexerState {
             is_active_indexer: AtomicBool::new(false),
             is_paused: AtomicBool::new(false),
             started_at,
+            bloom_filter: None,
         }
+    }
+
+    pub fn with_bloom_filter(mut self, bloom_filter: Arc<crate::bloom_filter::EventBloomFilter>) -> Self {
+        self.bloom_filter = Some(bloom_filter);
+        self
     }
 
     pub fn uptime_secs(&self) -> u64 {

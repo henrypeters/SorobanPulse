@@ -153,6 +153,9 @@ pub struct AppState {
         handlers::get_contract_event_counts,
         handlers::get_contract_summary,
         handlers::get_contracts_search,
+        handlers::check_contract_exists,
+        handlers::get_config,
+        handlers::reload_config,
     ),
     components(schemas(
         crate::models::Event,
@@ -165,6 +168,9 @@ pub struct AppState {
         crate::models::EventTypeBreakdown,
         crate::models::ContractSearchResult,
         crate::models::ContractSearchParams,
+        crate::models::ContractExistsResponse,
+        crate::models::ConfigResponse,
+        crate::models::ConfigReloadResponse,
         crate::models::EventStats,
         crate::models::ContractStatEntry,
         crate::models::ReplayRequest,
@@ -447,6 +453,9 @@ pub fn create_router_with_tx_and_tenant_map(
         )
         .route("/contracts", get(handlers::get_contracts))
         .route("/contracts/search", get(handlers::get_contracts_search))
+        .route("/contracts/exists", get(handlers::check_contract_exists))
+        .route("/config", get(handlers::get_config))
+        .route("/admin/config/reload", axum::routing::post(handlers::reload_config))
         .route("/contracts/{contract_id}/summary", get(handlers::get_contract_summary))
         .route("/contracts/{contract_id}/event-counts", get(handlers::get_contract_event_counts))
         .route("/admin/replay", axum::routing::post(handlers::replay_events))
@@ -639,6 +648,9 @@ pub fn create_router_with_tx_and_tenant_map(
         ))
         .layer(axum::middleware::from_fn(middleware::head_middleware))
         .layer(axum::middleware::from_fn(middleware::request_id_middleware))
+        .layer(axum::middleware::from_fn(
+            middleware::tracing_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             middleware::auth_middleware,

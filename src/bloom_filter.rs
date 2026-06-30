@@ -8,6 +8,7 @@
 use bloomfilter::Bloom;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
 
 use crate::metrics;
 
@@ -16,6 +17,10 @@ pub struct EventBloomFilter {
     inner: Mutex<Bloom<String>>,
     capacity: usize,
     fp_rate: f64,
+    /// Issue #627: Separate bloom filter for tracking contract existence
+    contract_filter: Mutex<Bloom<String>>,
+    /// Issue #627: Exact set of known contracts for fallback
+    known_contracts: Mutex<HashSet<String>>,
 }
 
 impl EventBloomFilter {
@@ -26,10 +31,14 @@ impl EventBloomFilter {
     pub fn new(capacity: usize, fp_rate: f64) -> Self {
         let bloom = Bloom::new_for_fp_rate(capacity, fp_rate)
             .expect("Failed to create bloom filter: invalid capacity or fp_rate");
+        let contract_bloom = Bloom::new_for_fp_rate(capacity / 10, fp_rate)
+            .expect("Failed to create contract bloom filter");
         Self {
             inner: Mutex::new(bloom),
             capacity,
             fp_rate,
+            contract_filter: Mutex::new(contract_bloom),
+            known_contracts: Mutex::new(HashSet::new()),
         }
     }
 
@@ -66,9 +75,44 @@ impl EventBloomFilter {
     /// Used at startup to pre-populate from recent DB rows.
     pub fn seed(&self, entries: impl IntoIterator<Item = (String, String, String)>) {
         let mut guard = self.inner.lock().expect("bloom filter lock poisoned");
+        let mut contract_guard = self.contract_filter.lock().expect("contract filter lock poisoned");
+        let mut known_contracts = self.known_contracts.lock().expect("known_contracts lock poisoned");
+        
         for (tx_hash, contract_id, event_type) in entries {
             let k = Self::key(&tx_hash, &contract_id, &event_type);
             guard.set(&k);
+            
+            // Track contract existence
+            contract_guard.set(&contract_id);
+            known_contracts.insert(contract_id);
+        }
+    }
+
+    /// Issue #627: Check if a contract has any indexed events.
+    /// Returns true if the contract is likely to exist (may have false positives).
+    pub fn contains_contract(&self, contract_id: &str) -> bool {
+        // First check the exact set for fast paths
+        if let Ok(known) = self.known_contracts.lock() {
+            if known.contains(contract_id) {
+                return true;
+            }
+        }
+        
+        // Then check the bloom filter
+        if let Ok(guard) = self.contract_filter.lock() {
+            return guard.check(contract_id);
+        }
+        
+        false
+    }
+
+    /// Issue #627: Add a contract to the bloom filter.
+    pub fn add_contract(&self, contract_id: &str) {
+        if let Ok(mut guard) = self.contract_filter.lock() {
+            guard.set(contract_id);
+        }
+        if let Ok(mut known) = self.known_contracts.lock() {
+            known.insert(contract_id.to_string());
         }
     }
 }
