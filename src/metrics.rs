@@ -549,15 +549,36 @@ pub fn record_query_plan_estimated_rows(query_type: &str, estimated_rows: f64) {
     .record(estimated_rows);
 }
 
-// ── Materialized view stale-data metrics ──────────────────────────────────────
+// ── Health check metrics ──────────────────────────────────────────────────────
 
-/// Record how many seconds ago a materialized view was last refreshed.
-pub fn record_matview_staleness_seconds(view: &str, age_secs: f64) {
-    m::gauge!(
-        "soroban_pulse_matview_staleness_seconds",
-        "view" => view.to_string()
-    )
-    .set(age_secs);
+/// Record successful PostgreSQL health check
+pub fn record_postgres_health_ok(response_time_ms: u64) {
+    m::counter!("soroban_pulse_postgres_health_checks_total", "status" => "ok").increment(1);
+    m::histogram!("soroban_pulse_postgres_health_check_duration_ms").record(response_time_ms as f64);
+}
+
+/// Record degraded PostgreSQL health check
+pub fn record_postgres_health_degraded(response_time_ms: u64) {
+    m::counter!("soroban_pulse_postgres_health_checks_total", "status" => "degraded").increment(1);
+    m::histogram!("soroban_pulse_postgres_health_check_duration_ms").record(response_time_ms as f64);
+}
+
+/// Record failed PostgreSQL health check
+pub fn record_postgres_health_error(response_time_ms: u64) {
+    m::counter!("soroban_pulse_postgres_health_checks_total", "status" => "error").increment(1);
+    m::histogram!("soroban_pulse_postgres_health_check_duration_ms").record(response_time_ms as f64);
+}
+
+/// Record successful RPC health check
+pub fn record_rpc_health_ok(response_time_ms: u64) {
+    m::counter!("soroban_pulse_rpc_health_checks_total", "status" => "ok").increment(1);
+    m::histogram!("soroban_pulse_rpc_health_check_duration_ms").record(response_time_ms as f64);
+}
+
+/// Record failed RPC health check
+pub fn record_rpc_health_error(response_time_ms: u64) {
+    m::counter!("soroban_pulse_rpc_health_checks_total", "status" => "error").increment(1);
+    m::histogram!("soroban_pulse_rpc_health_check_duration_ms").record(response_time_ms as f64);
 }
 
 #[cfg(test)]

@@ -634,6 +634,90 @@ pub async fn unsubscribe(
 
 #[utoipa::path(
     get,
+    path = "/healthz/postgres",
+    tag = "system",
+    responses(
+        (status = 200, description = "PostgreSQL is healthy", body = serde_json::Value),
+        (status = 503, description = "PostgreSQL is unhealthy", body = serde_json::Value),
+    )
+)]
+pub async fn health_postgres(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let pg_health = crate::health_check::check_postgres(&state.pool, state.health_check_timeout_ms).await;
+    
+    let status_code = match pg_health.status {
+        crate::health_check::HealthStatus::Ok => StatusCode::OK,
+        crate::health_check::HealthStatus::Degraded => StatusCode::OK,
+        crate::health_check::HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    (status_code, Json(json!(pg_health)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/healthz/rpc",
+    tag = "system",
+    responses(
+        (status = 200, description = "RPC endpoint is healthy", body = serde_json::Value),
+        (status = 503, description = "RPC endpoint is unhealthy", body = serde_json::Value),
+    )
+)]
+pub async fn health_rpc(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let rpc_health = crate::health_check::check_rpc(
+        &state.config.stellar_rpc_url,
+        state.health_check_timeout_ms,
+    )
+    .await;
+    
+    let status_code = match rpc_health.status {
+        crate::health_check::HealthStatus::Ok => StatusCode::OK,
+        crate::health_check::HealthStatus::Degraded => StatusCode::OK,
+        crate::health_check::HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    (status_code, Json(json!(rpc_health)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/healthz/external/{service}",
+    tag = "system",
+    params(("service" = String, Path, description = "External service name (e.g., 'webhooks', 'email')")),
+    responses(
+        (status = 200, description = "External service is healthy", body = serde_json::Value),
+        (status = 400, description = "Invalid service name", body = serde_json::Value),
+        (status = 503, description = "External service is unhealthy", body = serde_json::Value),
+    )
+)]
+pub async fn health_external(
+    State(_state): State<AppState>,
+    Path(service): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    // Validate service name
+    let valid_services = vec!["webhooks", "email", "sms", "pagerduty"];
+    if !valid_services.contains(&service.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Unknown service: {}. Valid services are: {}", service, valid_services.join(", ")),
+                "valid_services": valid_services,
+            })),
+        );
+    }
+
+    let external_health = crate::health_check::check_external_service(&service, 5000).await;
+    
+    let status_code = match external_health.status {
+        crate::health_check::HealthStatus::Ok => StatusCode::OK,
+        crate::health_check::HealthStatus::Degraded => StatusCode::OK,
+        crate::health_check::HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    (status_code, Json(json!(external_health)))
+}
+
+#[utoipa::path(
+    get,
     path = "/v1/status",
     tag = "system",
     responses(

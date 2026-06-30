@@ -13,6 +13,7 @@ pub mod email;
 pub mod encryption;
 pub mod error;
 pub mod handlers;
+pub mod health_check;
 pub mod indexer;
 pub mod kinesis;
 #[cfg(feature = "lua")]
