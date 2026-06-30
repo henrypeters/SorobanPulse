@@ -28,6 +28,9 @@ export interface ConfigurationParameters {
     credentials?: RequestCredentials; //value for the credentials param we want to use on each request
     maxRetries?: number; // maximum number of retries for transient server errors (default: 3)
     retryOnStatus?: number[]; // HTTP status codes that trigger a retry (default: [429, 500, 502, 503, 504])
+    retryInitialDelayMs?: number; // initial delay for exponential backoff in milliseconds (default: 1000)
+    retryMaxDelayMs?: number; // maximum delay between retries in milliseconds (default: 32000)
+    onRetry?: (attempt: number, delay: number, reason: string) => void; // callback when retry occurs
 }
 
 export class Configuration {
@@ -92,6 +95,18 @@ export class Configuration {
     get retryOnStatus(): number[] {
         return this.configuration.retryOnStatus ?? [429, 500, 502, 503, 504];
     }
+
+    get retryInitialDelayMs(): number {
+        return this.configuration.retryInitialDelayMs ?? 1000;
+    }
+
+    get retryMaxDelayMs(): number {
+        return this.configuration.retryMaxDelayMs ?? 32000;
+    }
+
+    get onRetry(): ((attempt: number, delay: number, reason: string) => void) | undefined {
+        return this.configuration.onRetry;
+    }
 }
 
 export const DefaultConfig = new Configuration();
@@ -145,6 +160,8 @@ export class BaseAPI {
         const { url, init } = await this.createFetchParams(context, initOverrides);
         const maxRetries = this.configuration.maxRetries;
         const retryOnStatus = this.configuration.retryOnStatus;
+        const initialDelayMs = this.configuration.retryInitialDelayMs ?? 1000;
+        const maxDelayMs = this.configuration.retryMaxDelayMs ?? 32000;
 
         let response: Response | undefined;
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -158,11 +175,18 @@ export class BaseAPI {
                 if (retryAfterHeader !== null) {
                     const parsed = parseFloat(retryAfterHeader);
                     delayMs = isNaN(parsed)
-                        ? (Math.pow(2, attempt) + Math.random()) * 1000
-                        : parsed * 1000;
+                        ? Math.min(Math.pow(2, attempt) * initialDelayMs + Math.random() * initialDelayMs, maxDelayMs)
+                        : Math.min(parsed * 1000, maxDelayMs);
                 } else {
-                    delayMs = (Math.pow(2, attempt) + Math.random()) * 1000;
+                    // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s (configurable)
+                    delayMs = Math.min(Math.pow(2, attempt) * initialDelayMs + Math.random() * initialDelayMs, maxDelayMs);
                 }
+                
+                const reason = `HTTP ${response.status}`;
+                if (this.configuration.onRetry) {
+                    this.configuration.onRetry(attempt + 1, delayMs, reason);
+                }
+                
                 await new Promise<void>(resolve => setTimeout(resolve, delayMs));
                 continue;
             }
