@@ -11,7 +11,9 @@ A lightweight Rust backend service that indexes Soroban smart contract events on
 
 ## Architecture
 
-For a comprehensive understanding of the system architecture, including component interactions, event flow, and deployment patterns, see [docs/architecture.md](docs/architecture.md).
+![SorobanPulse System Architecture](docs/architecture.svg)
+
+For a full walkthrough of components, data flow, and deployment patterns, see [docs/architecture.md](docs/architecture.md).
 
 The system follows this high-level flow:
 - **Stellar RPC** → **Indexer** → **PostgreSQL** → **REST API/SSE** → **Clients**

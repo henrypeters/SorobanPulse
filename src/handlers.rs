@@ -828,6 +828,72 @@ pub async fn get_event_stats(State(state): State<AppState>) -> Result<impl IntoR
     Ok((headers, Json(stats_json)))
 }
 
+/// Return per-contract daily event counts sourced from the `mv_contract_event_counts`
+/// materialized view.  Results are cached in the in-process query cache for the
+/// duration of `QUERY_CACHE_TTL_SECS` (default 5 min, clamped to [5 min, 60 min]).
+#[utoipa::path(
+    get,
+    path = "/v1/contracts/{contract_id}/event-counts",
+    tag = "events",
+    params(
+        ("contract_id" = String, Path, description = "Stellar contract ID"),
+    ),
+    responses(
+        (status = 200, description = "Daily event counts for the contract"),
+        (status = 400, description = "Invalid contract_id", body = ErrorResponse),
+    )
+)]
+pub async fn get_contract_event_counts(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    validate_contract_id(&contract_id)?;
+
+    let cache_key = format!("contract_event_counts:{contract_id}");
+
+    if let Some(cached) = crate::query_cache::get(&state.query_result_cache, &cache_key).await {
+        return Ok(Json(cached));
+    }
+
+    let rows = sqlx::query(
+        "SELECT event_type, event_day, event_count, unique_tx_count, last_event_at \
+         FROM mv_contract_event_counts \
+         WHERE contract_id = $1 \
+         ORDER BY event_day DESC \
+         LIMIT 90",
+    )
+    .bind(&contract_id)
+    .fetch_all(&state.read_pool)
+    .await?;
+
+    let counts: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "event_type":      r.try_get::<String, _>("event_type").unwrap_or_default(),
+                "event_day":       r.try_get::<chrono::DateTime<chrono::Utc>, _>("event_day").ok()
+                                     .map(|d| d.format("%Y-%m-%d").to_string())
+                                     .unwrap_or_default(),
+                "event_count":     r.try_get::<i64, _>("event_count").unwrap_or(0),
+                "unique_tx_count": r.try_get::<i64, _>("unique_tx_count").unwrap_or(0),
+                "last_event_at":   r.try_get::<chrono::DateTime<chrono::Utc>, _>("last_event_at").ok()
+                                     .map(|t| t.to_rfc3339())
+                                     .unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    let result = json!({
+        "contract_id": contract_id,
+        "counts":      counts,
+        "cached_at":   Utc::now().to_rfc3339(),
+    });
+
+    crate::query_cache::set(&state.query_result_cache, cache_key, result.clone()).await;
+
+    Ok(Json(result))
+}
+
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct ContractHistoryParams {
     pub bucket: Option<String>,
@@ -1130,57 +1196,91 @@ pub async fn stream_events_multi(
     let max_lag = state.config.sse_max_lag_before_disconnect;
     let connection_id = Uuid::new_v4().to_string();
 
-    // #454: Replay missed events for any of the subscribed contracts.
+    // Replay missed events if the client sends Last-Event-ID.
+    // Try ring buffer first; fall back to DB on miss.
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
-    let replay: Vec<crate::models::Event> = if let Some(last_id) = last_event_id {
-        let base_offset = 2usize;
-        let placeholders: String = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("${}", base_offset + i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let tid = tenant_id.as_deref();
-        let tenant_clause = if tid.is_some() {
-            format!(" AND tenant_id = ${}", base_offset + ids.len())
-        } else {
-            String::new()
-        };
-        let sql = format!(
-            "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, 0::bigint AS total_count \
-             FROM events WHERE created_at > (SELECT created_at FROM events WHERE id = $1) \
-             AND contract_id IN ({}){} ORDER BY created_at ASC LIMIT {}",
-            placeholders, tenant_clause, state.config.sse_replay_limit
-        );
-        let mut q = sqlx::query_as::<_, crate::models::Event>(&sql).bind(last_id);
-        for id in &ids {
-            q = q.bind(id);
+    let ring_replay_multi: Vec<crate::models::SorobanEvent> = if let Some(last_id) = last_event_id {
+        match state.sse_ring_buffer.events_since(last_id) {
+            Some(events) => events
+                .into_iter()
+                .filter(|ev| {
+                    if !ids.contains(&ev.contract_id) { return false; }
+                    if let Some(et) = event_type_filter {
+                        if ev.event_type != et.to_string() { return false; }
+                    }
+                    true
+                })
+                .take(state.config.sse_replay_limit as usize)
+                .collect(),
+            None => {
+                crate::metrics::record_sse_ring_buffer_miss();
+                vec![]
+            }
         }
-        if let Some(tid) = tid {
-            q = q.bind(tid);
-        }
-        q.fetch_all(&state.pool).await.unwrap_or_default()
     } else {
         vec![]
     };
 
-    let has_replay = !replay.is_empty();
+    // DB fallback for multi-stream when ring buffer misses.
+    let db_replay_multi: Vec<crate::models::Event> =
+        if last_event_id.is_some() && ring_replay_multi.is_empty() {
+            let last_id = last_event_id.unwrap();
+            let base_offset = 2usize;
+            let placeholders: String = ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("${}", base_offset + i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tid = tenant_id.as_deref();
+            let tenant_clause = if tid.is_some() {
+                format!(" AND tenant_id = ${}", base_offset + ids.len())
+            } else {
+                String::new()
+            };
+            let sql = format!(
+                "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, 0::bigint AS total_count \
+                 FROM events WHERE created_at > (SELECT created_at FROM events WHERE id = $1) \
+                 AND contract_id IN ({}){} ORDER BY created_at ASC LIMIT {}",
+                placeholders, tenant_clause, state.config.sse_replay_limit
+            );
+            let mut q = sqlx::query_as::<_, crate::models::Event>(&sql).bind(last_id);
+            for id in &ids {
+                q = q.bind(id);
+            }
+            if let Some(tid) = tid {
+                q = q.bind(tid);
+            }
+            q.fetch_all(&state.pool).await.unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+    let total_replayed_multi = ring_replay_multi.len() + db_replay_multi.len();
+    if total_replayed_multi > 0 {
+        crate::metrics::record_sse_replayed_events(total_replayed_multi as u64);
+    }
+
+    let has_replay = total_replayed_multi > 0;
     let rx = state.event_tx.subscribe();
     let enc_key = state.encryption_key;
     let enc_key_old = state.encryption_key_old;
 
-    // #452: Apply event_type filter during replay
-    let et_filter_replay = event_type_filter;
-    let replay_stream = futures::stream::iter(replay.into_iter().filter_map(move |mut ev| {
-        if let Some(et) = et_filter_replay {
-            if ev.event_type != et {
-                return None;
-            }
-        }
+    let replay_stream = futures::stream::iter(ring_replay_multi.into_iter().map(move |ev| {
+        let eid = ev.id.map(|u| u.to_string())
+            .unwrap_or_else(|| format!("{}-{}", ev.tx_hash, ev.ledger));
+        let data = serde_json::to_string(&ev).unwrap_or_default();
+        Ok(Event::default()
+            .id(eid)
+            .retry(Duration::from_millis(keepalive_ms))
+            .data(data))
+    }));
+
+    let db_replay_stream_multi = futures::stream::iter(db_replay_multi.into_iter().filter_map(move |mut ev| {
         ev.event_data = decrypt_event_data(&ev.event_data, enc_key.as_ref(), enc_key_old.as_ref());
         let data = serde_json::to_string(&ev).unwrap_or_default();
         Some(Ok(Event::default()
@@ -1226,8 +1326,10 @@ pub async fn stream_events_multi(
                                 }
                             }
                             let data = serde_json::to_string(&event).unwrap_or_default();
+                            let eid = event.id.map(|u| u.to_string())
+                                .unwrap_or_else(|| format!("{}-{}", event.tx_hash, event.ledger));
                             let sse = Event::default()
-                                .id(format!("{}-{}", event.tx_hash, event.ledger))
+                                .id(eid)
                                 .retry(Duration::from_millis(ka))
                                 .data(data);
                             return Some((Ok(sse), (rx, filter_ids, ka, tid, et_filter, false, max_lag, conn_id)));
@@ -1257,7 +1359,10 @@ pub async fn stream_events_multi(
         },
     );
 
-    let combined = replay_stream.chain(replay_complete_stream).chain(live_stream);
+    let combined = replay_stream
+        .chain(db_replay_stream_multi)
+        .chain(replay_complete_stream)
+        .chain(live_stream);
 
     let stream_with_cleanup = futures::stream::unfold(
         (Box::pin(combined), sse_connections.clone(), sse_connections_per_ip, client_ip_cleanup, max_per_ip_cleanup),
@@ -1450,13 +1555,51 @@ async fn stream_events_internal(
         if cols.is_empty() { None } else { Some(cols) }
     });
 
-    // #454: Replay missed events if the client sends Last-Event-ID
+    // Replay missed events if the client sends Last-Event-ID.
+    // Strategy: check the in-memory ring buffer first (O(n), no DB round-trip).
+    // If the ID was evicted (buffer overflow), fall back to a DB query.
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    let replay: Vec<crate::models::Event> = if let Some(last_id) = last_event_id {
+    // Ring-buffer replay: returns SorobanEvent (broadcast type), converted to SSE frames directly.
+    let ring_replay: Vec<crate::models::SorobanEvent> = if let Some(last_id) = last_event_id {
+        match state.sse_ring_buffer.events_since(last_id) {
+            Some(events) => {
+                // Apply contract filter and event_type filter
+                events
+                    .into_iter()
+                    .filter(|ev| {
+                        if let Some(ref cid) = contract_filter {
+                            if &ev.contract_id != cid {
+                                return false;
+                            }
+                        }
+                        if let Some(et) = event_type_filter {
+                            if ev.event_type != et.to_string() {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .take(state.config.sse_replay_limit as usize)
+                    .collect()
+            }
+            None => {
+                // Ring buffer miss — evicted; fall back to DB query.
+                crate::metrics::record_sse_ring_buffer_miss();
+                vec![]
+            }
+        }
+    } else {
+        vec![]
+    };
+
+    // DB fallback replay when ring buffer miss occurs (last_event_id set but ring returned empty
+    // because of eviction). Also used when ring buffer is disabled.
+    let db_replay: Vec<crate::models::Event> = if last_event_id.is_some() && ring_replay.is_empty() {
+        let last_id = last_event_id.unwrap();
         let q = if let Some(ref cid) = contract_filter {
             sqlx::query_as::<_, crate::models::Event>(
                 "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, event_data_normalized, created_at, schema_version, 0::bigint AS total_count \
@@ -1484,7 +1627,12 @@ async fn stream_events_internal(
         vec![]
     };
 
-    let has_replay = !replay.is_empty();
+    let total_replayed = ring_replay.len() + db_replay.len();
+    if total_replayed > 0 {
+        crate::metrics::record_sse_replayed_events(total_replayed as u64);
+    }
+
+    let has_replay = total_replayed > 0;
     let rx = state.event_tx.subscribe();
     let enc_key = state.encryption_key;
     let enc_key_old = state.encryption_key_old;
@@ -1492,16 +1640,20 @@ async fn stream_events_internal(
     // Generate a stable connection ID for lag metrics
     let connection_id = Uuid::new_v4().to_string();
 
+    // Ring-buffer replay stream: SorobanEvent items already filtered above.
+    let ring_replay_stream = stream::iter(ring_replay.into_iter().map(move |ev| {
+        let id_str = ev.id.map(|u| u.to_string())
+            .unwrap_or_else(|| format!("{}-{}", ev.tx_hash, ev.ledger));
+        let data = serde_json::to_string(&ev).unwrap_or_default();
+        Ok(Event::default()
+            .id(id_str)
+            .retry(Duration::from_millis(keepalive_ms))
+            .data(data))
+    }));
+
     let field_columns_replay = field_columns.clone();
-    // #452: Apply event_type filter during replay
-    let et_filter_replay = event_type_filter;
-    let replay_stream = stream::iter(replay.into_iter().filter_map(move |mut ev| {
-        // #452: Filter by event_type during replay
-        if let Some(et) = et_filter_replay {
-            if ev.event_type != et {
-                return None;
-            }
-        }
+    // DB fallback replay stream: full Event records from DB.
+    let db_replay_stream = stream::iter(db_replay.into_iter().filter_map(move |mut ev| {
         ev.event_data = decrypt_event_data(&ev.event_data, enc_key.as_ref(), enc_key_old.as_ref());
         let data = match &field_columns_replay {
             Some(cols) => serde_json::to_string(&filter_fields(
@@ -1519,7 +1671,7 @@ async fn stream_events_internal(
             .data(data)))
     }));
 
-    // #454: replay_complete event after replay
+    // replay_complete sentinel after all replayed events.
     let replay_complete_stream = if has_replay {
         stream::iter(vec![Ok(Event::default()
             .event("replay_complete")
@@ -1571,8 +1723,10 @@ async fn stream_events_internal(
                                 }
                             }
                             let data = serde_json::to_string(&event).unwrap_or_default();
+                            let eid = event.id.map(|u| u.to_string())
+                                .unwrap_or_else(|| format!("{}-{}", event.tx_hash, event.ledger));
                             let sse = Event::default()
-                                .id(event.id.to_string())
+                                .id(eid)
                                 .retry(Duration::from_millis(ka))
                                 .data(data);
                             return Some((Ok(sse), (rx, filter, ka, cols, ek, ek_old, tid, et_filter, false, shutdown_rx, max_lag, conn_id)));
@@ -1613,7 +1767,10 @@ async fn stream_events_internal(
         },
     );
 
-    let combined = replay_stream.chain(replay_complete_stream).chain(live_stream);
+    let combined = ring_replay_stream
+        .chain(db_replay_stream)
+        .chain(replay_complete_stream)
+        .chain(live_stream);
     let combined = Box::pin(combined);
 
     // Wrap the stream to decrement the connection counter when the stream ends
@@ -5236,6 +5393,7 @@ mod tests {
             None,
             Arc::new(hashed_map),
             shutdown_rx,
+            crate::sse_ring_buffer::SseRingBuffer::new(100),
         )
     }
 
@@ -7506,6 +7664,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (hash_api_key(k), v.clone()))
             .collect();
+        let (_, shutdown_rx_multi) = tokio::sync::watch::channel(false);
         let app = crate::routes::create_router_with_tx_and_tenant_map(
             pool.clone(),
             pool,
@@ -7525,6 +7684,8 @@ mod tests {
             config,
             None,
             Arc::new(hashed_map),
+            shutdown_rx_multi,
+            crate::sse_ring_buffer::SseRingBuffer::new(100),
         );
 
         let resp = app
@@ -9528,6 +9689,7 @@ mod tests {
             None,
             Arc::new(std::collections::HashMap::new()),
             shutdown_rx,
+            crate::sse_ring_buffer::SseRingBuffer::new(100),
         );
 
         let contract_id = "CCACHEINVAL1234567890123456789012345678901234567890123456";

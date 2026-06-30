@@ -98,8 +98,10 @@ pub struct AppState {
     pub super_admin_key_hash: Option<String>,
     /// Issue #607: In-process ABI cache (LRU-bounded, 24 h TTL by default).
     pub abi_cache: crate::abi::AbiCache,
-    /// Issue #626: Aggregation result cache (TTL and max-entries from config).
-    pub aggregation_cache: moka::future::Cache<String, serde_json::Value>,
+    /// In-memory SSE event replay ring buffer (10 k events, FIFO eviction).
+    pub sse_ring_buffer: std::sync::Arc<crate::sse_ring_buffer::SseRingBuffer>,
+    /// TTL-bounded query result cache for materialized-view backed queries.
+    pub query_result_cache: std::sync::Arc<moka::future::Cache<String, serde_json::Value>>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -153,6 +155,7 @@ pub struct AppState {
         handlers::start_mask_events,
         handlers::get_mask_job_status,
         handlers::get_timeseries,
+        handlers::get_contract_event_counts,
         handlers::get_contract_summary,
         handlers::get_contracts_search,
     ),
@@ -271,10 +274,11 @@ pub fn create_router_with_tx(
         health_check_timeout_ms,
         encryption_key,
         encryption_key_old,
-        config,
+        config.clone(),
         schema_validator,
         Arc::new(std::collections::HashMap::new()),
         shutdown_rx,
+        crate::sse_ring_buffer::SseRingBuffer::new(config.sse_ring_buffer_capacity),
     )
 }
 
@@ -300,6 +304,7 @@ pub fn create_router_with_tx_and_tenant_map(
     schema_validator: Option<Arc<crate::schema_validator::SchemaValidator>>,
     tenant_map: Arc<std::collections::HashMap<String, String>>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    sse_ring_buffer: std::sync::Arc<crate::sse_ring_buffer::SseRingBuffer>,
 ) -> Router {
     let cors = build_cors(allowed_origins);
 
@@ -341,11 +346,11 @@ pub fn create_router_with_tx_and_tenant_map(
         .time_to_live(std::time::Duration::from_secs(config.abi_cache_ttl_secs))
         .build();
 
-    // Issue #626: build the aggregation result cache from config.
-    let aggregation_cache = moka::future::Cache::builder()
-        .max_capacity(config.aggregation_cache_max_entries)
-        .time_to_live(std::time::Duration::from_secs(config.aggregation_cache_ttl_secs))
-        .build();
+    // Query result cache for materialized-view backed queries.
+    let query_result_cache = crate::query_cache::build(
+        config.query_cache_ttl_secs,
+        config.query_cache_max_capacity,
+    );
 
     let app_state = AppState {
         pool,
@@ -369,7 +374,8 @@ pub fn create_router_with_tx_and_tenant_map(
         sse_connections_per_ip: Arc::new(DashMap::new()),
         super_admin_key_hash,
         abi_cache,
-        aggregation_cache,
+        sse_ring_buffer,
+        query_result_cache,
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
@@ -447,6 +453,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/contracts", get(handlers::get_contracts))
         .route("/contracts/search", get(handlers::get_contracts_search))
         .route("/contracts/{contract_id}/summary", get(handlers::get_contract_summary))
+        .route("/contracts/{contract_id}/event-counts", get(handlers::get_contract_event_counts))
         .route("/admin/replay", axum::routing::post(handlers::replay_events))
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
         .route("/admin/mask-events", axum::routing::post(handlers::start_mask_events))

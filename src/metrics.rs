@@ -524,6 +524,68 @@ pub fn record_decompression_failure() {
     m::counter!("soroban_pulse_decompression_failures_total").increment(1);
 }
 
+// ── SSE ring buffer metrics ──────────────────────────────────────────────────
+
+/// Record the number of events replayed to a reconnecting SSE client.
+pub fn record_sse_replayed_events(count: u64) {
+    m::counter!("soroban_pulse_sse_replayed_events_total").increment(count);
+}
+
+/// Record a ring-buffer overflow (oldest event evicted to make room).
+pub fn record_sse_ring_buffer_overflow() {
+    m::counter!("soroban_pulse_sse_ring_buffer_overflows_total").increment(1);
+}
+
+/// Update the current number of events stored in the ring buffer.
+pub fn update_sse_ring_buffer_size(size: usize) {
+    m::gauge!("soroban_pulse_sse_ring_buffer_size").set(size as f64);
+}
+
+/// Record a ring-buffer miss — client's Last-Event-ID was evicted; replay fell back to DB.
+pub fn record_sse_ring_buffer_miss() {
+    m::counter!("soroban_pulse_sse_ring_buffer_misses_total").increment(1);
+}
+
+// ── Query result cache metrics ────────────────────────────────────────────────
+
+/// Record a query-result cache hit.
+pub fn record_query_cache_hit(query_type: &str) {
+    m::counter!(
+        "soroban_pulse_query_cache_hits_total",
+        "query_type" => query_type.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a query-result cache miss.
+pub fn record_query_cache_miss(query_type: &str) {
+    m::counter!(
+        "soroban_pulse_query_cache_misses_total",
+        "query_type" => query_type.to_string()
+    )
+    .increment(1);
+}
+
+/// Record the estimated row count from a query execution plan (EXPLAIN).
+pub fn record_query_plan_estimated_rows(query_type: &str, estimated_rows: f64) {
+    m::histogram!(
+        "soroban_pulse_query_plan_estimated_rows",
+        "query_type" => query_type.to_string()
+    )
+    .record(estimated_rows);
+}
+
+// ── Materialized view stale-data metrics ──────────────────────────────────────
+
+/// Record how many seconds ago a materialized view was last refreshed.
+pub fn record_matview_staleness_seconds(view: &str, age_secs: f64) {
+    m::gauge!(
+        "soroban_pulse_matview_staleness_seconds",
+        "view" => view.to_string()
+    )
+    .set(age_secs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

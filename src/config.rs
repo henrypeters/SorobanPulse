@@ -393,27 +393,16 @@ pub struct Config {
     /// Maximum number of ABIs kept in the in-process cache.
     pub abi_cache_max_entries: u64,
 
-    // Issue #623: Event archival to cold storage
-    /// S3 bucket name for archived events. When set, the archiver is enabled.
-    pub archive_s3_bucket: Option<String>,
-    /// S3 key prefix for archived events (default "events").
-    pub archive_s3_prefix: String,
-    /// Age in days after which events are eligible for archival (default 30).
-    pub archive_after_days: u32,
-    /// Archive format: "ndjson" (default) or "parquet".
-    pub archive_format: String,
+    // SSE reconnection ring buffer
+    /// Maximum number of events stored in the in-memory SSE replay ring buffer.
+    /// When full the oldest event is evicted. Default: 10 000.
+    pub sse_ring_buffer_capacity: usize,
 
-    // Issue #624: Batch query optimization
-    /// Maximum number of tx hashes accepted by the batch tx endpoint (default 100).
-    pub batch_tx_max_size: usize,
-    /// Maximum number of events returned by the bulk batch endpoint (default 10_000).
-    pub batch_events_max_size: usize,
-
-    // Issue #626: Aggregation result cache
-    /// TTL in seconds for aggregation endpoint cache entries (default 60).
-    pub aggregation_cache_ttl_secs: u64,
-    /// Maximum number of entries in the aggregation result cache.
-    pub aggregation_cache_max_entries: u64,
+    // Query result cache (materialized-view backed queries)
+    /// TTL in seconds for cached query results. Clamped to [300, 3600].
+    pub query_cache_ttl_secs: u64,
+    /// Maximum number of cached query results.
+    pub query_cache_max_capacity: u64,
 }
 
 impl Default for Config {
@@ -554,14 +543,9 @@ impl Default for Config {
             ledger_hash_validation_depth: 1_000,
             abi_cache_ttl_secs: crate::abi::DEFAULT_ABI_CACHE_TTL_SECS,
             abi_cache_max_entries: crate::abi::ABI_CACHE_MAX_ENTRIES,
-            archive_s3_bucket: None,
-            archive_s3_prefix: "events".to_string(),
-            archive_after_days: 30,
-            archive_format: "ndjson".to_string(),
-            batch_tx_max_size: 100,
-            batch_events_max_size: 10_000,
-            aggregation_cache_ttl_secs: 60,
-            aggregation_cache_max_entries: 1_000,
+            sse_ring_buffer_capacity: crate::sse_ring_buffer::DEFAULT_RING_BUFFER_CAPACITY,
+            query_cache_ttl_secs: crate::query_cache::DEFAULT_TTL_SECS,
+            query_cache_max_capacity: crate::query_cache::DEFAULT_MAX_CAPACITY,
         }
     }
 }
@@ -1557,17 +1541,17 @@ impl Config {
             abi_cache_max_entries: env_or_file("ABI_CACHE_MAX_ENTRIES", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(crate::abi::ABI_CACHE_MAX_ENTRIES),
-            // Issue #623: Event archival
-            archive_s3_bucket: env_or_file("ARCHIVE_S3_BUCKET", &file).filter(|s| !s.is_empty()),
-            archive_s3_prefix: env_or_file_or("ARCHIVE_S3_PREFIX", &file, "events"),
-            archive_after_days,
-            archive_format: env_or_file_or("ARCHIVE_FORMAT", &file, "ndjson"),
-            // Issue #624: Batch query
-            batch_tx_max_size,
-            batch_events_max_size,
-            // Issue #626: Aggregation cache
-            aggregation_cache_ttl_secs,
-            aggregation_cache_max_entries,
+            // SSE reconnection ring buffer
+            sse_ring_buffer_capacity: env_or_file("SSE_RING_BUFFER_CAPACITY", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::sse_ring_buffer::DEFAULT_RING_BUFFER_CAPACITY),
+            // Query result cache
+            query_cache_ttl_secs: env_or_file("QUERY_CACHE_TTL_SECS", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::query_cache::DEFAULT_TTL_SECS),
+            query_cache_max_capacity: env_or_file("QUERY_CACHE_MAX_CAPACITY", &file)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::query_cache::DEFAULT_MAX_CAPACITY),
         }
     }
 }

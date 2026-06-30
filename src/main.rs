@@ -54,6 +54,8 @@ mod oncall;
 mod xdr_validation;
 mod replica_monitor;
 mod feature_flags;
+mod sse_ring_buffer;
+mod query_cache;
 
 #[cfg(feature = "archive")]
 mod archiver;
@@ -408,6 +410,11 @@ async fn main() -> anyhow::Result<()> {
     indexer.set_indexer_state(indexer_state.clone());
     indexer.set_event_tx(event_tx.clone());
 
+    // Create the SSE ring buffer — shared between the indexer (writer) and HTTP
+    // handlers (reader for replay).
+    let sse_ring_buf = sse_ring_buffer::SseRingBuffer::new(config.sse_ring_buffer_capacity);
+    indexer.set_sse_ring_buffer(std::sync::Arc::clone(&sse_ring_buf));
+
     // Issue #266: Initialize and seed bloom filter
     {
         let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(
@@ -631,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
         Some(schema_validator),
         tenant_map,
         shutdown_rx.clone(),
+        sse_ring_buf,
     );
 
     info!(addr = %addr, "Soroban Pulse listening");

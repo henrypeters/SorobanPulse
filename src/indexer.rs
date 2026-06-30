@@ -301,6 +301,7 @@ pub struct Indexer<R: RpcClient> {
     bloom_filter: Option<Arc<EventBloomFilter>>,
     kinesis_publisher: Option<Arc<dyn KinesisPublisher>>,
     pubsub_publisher: Option<Arc<dyn PubSubPublisher>>,
+    sse_ring_buffer: Option<Arc<crate::sse_ring_buffer::SseRingBuffer>>,
     #[cfg(feature = "kafka")]
     kafka_publisher: Option<Arc<dyn crate::kafka::KafkaPublisher>>,
     #[cfg(feature = "kafka")]
@@ -328,6 +329,7 @@ impl<R: RpcClient> Indexer<R> {
             bloom_filter: None,
             kinesis_publisher: None,
             pubsub_publisher: None,
+            sse_ring_buffer: None,
             #[cfg(feature = "kafka")]
             kafka_publisher: None,
             #[cfg(feature = "kafka")]
@@ -350,6 +352,11 @@ impl<R: RpcClient> Indexer<R> {
     /// Set the broadcast sender for real-time SSE streaming.
     pub fn set_event_tx(&mut self, event_tx: broadcast::Sender<SorobanEvent>) {
         self.event_tx = Some(event_tx);
+    }
+
+    /// Attach the SSE ring buffer so broadcasted events are also stored for replay.
+    pub fn set_sse_ring_buffer(&mut self, buf: Arc<crate::sse_ring_buffer::SseRingBuffer>) {
+        self.sse_ring_buffer = Some(buf);
     }
 
     /// Set the bloom filter for pre-filtering duplicate events (issue #266).
@@ -811,6 +818,17 @@ impl<R: RpcClient> Indexer<R> {
                                 if self.config.multi_tenant {
                                     broadcast_event.tenant_id =
                                         self.config.indexer_tenant_id.clone();
+                                }
+                                // Push to SSE ring buffer before broadcasting so
+                                // reconnecting clients can replay from it.
+                                if let Some(ref buf) = self.sse_ring_buffer {
+                                    let prev_overflow = buf.overflow_count();
+                                    let eid = buf.push(broadcast_event.clone());
+                                    broadcast_event.id = Some(eid);
+                                    if buf.overflow_count() > prev_overflow {
+                                        crate::metrics::record_sse_ring_buffer_overflow();
+                                    }
+                                    crate::metrics::update_sse_ring_buffer_size(buf.len());
                                 }
                                 let _ = tx.send(broadcast_event);
                             }
