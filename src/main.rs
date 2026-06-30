@@ -35,6 +35,7 @@ mod pubsub;
 mod queue_publisher;
 mod rate_limiter;
 mod reencrypt;
+mod resource_metrics;
 mod routes;
 mod rpc_client;
 mod schema_validator;
@@ -511,6 +512,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn feature flag rollback watcher (#587)
     feature_flags::spawn(pool.clone(), 60, shutdown_rx.clone());
+
+    // Spawn resource metrics collector (#630)
+    resource_metrics::spawn_resource_collector(shutdown_rx.clone());
 
     // Spawn materialized-view refresh background task
     stats_refresh::spawn(
