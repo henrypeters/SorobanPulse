@@ -96,21 +96,30 @@ configuration = openapi_client.Configuration(
 
 ```python
 import openapi_client
+from openapi_client import RetryPolicyConfig
 
 configuration = openapi_client.Configuration(
     host="https://api.example.com",
-    max_retries=5,
-    retry_on_status=[429, 503],
 )
+
+retry_config = RetryPolicyConfig(
+    max_retries=5,
+    initial_delay_ms=500,
+    max_delay_ms=60000,
+    retryable_status_codes={429, 503},
+    on_retry=lambda attempt, delay, reason: print(
+        f"Retry {attempt}: {reason} (delay: {delay}ms)"
+    ),
+)
+
+api_client = openapi_client.ApiClient(configuration=configuration)
+# Apply retry policy to client
 ```
 
 ### Disabling retries
 
 ```python
-configuration = openapi_client.Configuration(
-    host="https://api.example.com",
-    max_retries=0,
-)
+retry_config = RetryPolicyConfig(max_retries=0)
 ```
 
 ### Retry-After support
@@ -122,7 +131,7 @@ When the server responds with a `Retry-After` header (e.g. `Retry-After: 5`), th
 For attempt *n* (0-indexed) without a `Retry-After` header:
 
 ```
-delay = 2^n + random(0, 1)  seconds
+delay = 2^n + random(0, 1)  seconds (capped at max_delay_ms)
 ```
 
 | Attempt | Base delay |
@@ -130,8 +139,33 @@ delay = 2^n + random(0, 1)  seconds
 | 1st retry | 1 s + jitter |
 | 2nd retry | 2 s + jitter |
 | 3rd retry | 4 s + jitter |
+| 4th retry | 8 s + jitter |
+| 5th retry | 16 s + jitter |
 
 After exhausting all retries the last server response is returned to the caller.
+
+### Retry Policies
+
+Pre-configured policies are available:
+
+```python
+from openapi_client import (
+    create_default_retry_policy,
+    create_aggressive_retry_policy,
+    create_conservative_retry_policy,
+)
+
+# Default: 3 retries, 1s initial, 32s max
+default_policy = create_default_retry_policy()
+
+# Aggressive: 5 retries, 500ms initial, 60s max
+aggressive_policy = create_aggressive_retry_policy()
+
+# Conservative: 1 retry, 2s initial, 5s max
+conservative_policy = create_conservative_retry_policy()
+```
+
+For more details, see [RETRY_AND_BACKOFF.md](./RETRY_AND_BACKOFF.md)
 
 ---
 
