@@ -381,6 +381,307 @@ async fn schedule_retry(pool: &PgPool, queue_id: Uuid, error: &str) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Email notification config (Issue #619)
+// ---------------------------------------------------------------------------
+
+/// Daily email send limit per address.
+const EMAIL_DAILY_LIMIT: i64 = 100;
+
+/// Check whether the given address is under the daily send limit and, if so,
+/// atomically increment the counter.  Returns `true` when the send is allowed.
+pub async fn check_and_increment_email_rate_limit(
+    pool: &PgPool,
+    email: &str,
+) -> Result<bool, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO email_send_counters (email_address, date_utc, send_count)
+         VALUES ($1, CURRENT_DATE, 1)
+         ON CONFLICT (email_address, date_utc)
+         DO UPDATE SET send_count = email_send_counters.send_count + 1
+         RETURNING send_count",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0 <= EMAIL_DAILY_LIMIT)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubscriptionEmailConfig {
+    pub email_address: Option<String>,
+    pub email_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateEmailConfigRequest {
+    /// Destination email address. Required when enabling.
+    pub email_address: Option<String>,
+    pub enabled: bool,
+}
+
+/// `GET /v1/subscriptions/{id}/email` — return the email config for a subscription.
+pub async fn get_subscription_email(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let row: Option<(Option<String>, bool)> = sqlx::query_as(
+        "SELECT email_address, email_enabled FROM subscriptions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (email_address, email_enabled) = row.ok_or(AppError::NotFound)?;
+
+    // Daily send count for this address, if configured.
+    let daily_sent: Option<i64> = if let Some(ref addr) = email_address {
+        sqlx::query_scalar(
+            "SELECT send_count FROM email_send_counters \
+             WHERE email_address = $1 AND date_utc = CURRENT_DATE",
+        )
+        .bind(addr)
+        .fetch_optional(&state.pool)
+        .await?
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "subscription_id": id,
+        "email_address": email_address,
+        "email_enabled": email_enabled,
+        "daily_send_limit": EMAIL_DAILY_LIMIT,
+        "daily_sent_today": daily_sent.unwrap_or(0),
+    })))
+}
+
+/// `PUT /v1/subscriptions/{id}/email` — configure or update email notifications.
+pub async fn update_subscription_email(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateEmailConfigRequest>,
+) -> Result<Json<Value>, AppError> {
+    if body.enabled {
+        match &body.email_address {
+            None => {
+                return Err(AppError::Validation(
+                    "email_address is required when enabling email notifications".into(),
+                ))
+            }
+            Some(addr) => {
+                if addr.is_empty() || !addr.contains('@') {
+                    return Err(AppError::Validation("invalid email_address".into()));
+                }
+            }
+        }
+    }
+
+    let rows = sqlx::query(
+        "UPDATE subscriptions
+         SET email_address = $2, email_enabled = $3
+         WHERE id = $1 AND status = 'active'",
+    )
+    .bind(id)
+    .bind(&body.email_address)
+    .bind(body.enabled)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    if rows == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    // Log the config change for auditability.
+    crate::metrics::record_email_subscription_updated();
+
+    Ok(Json(json!({
+        "subscription_id": id,
+        "email_address": body.email_address,
+        "email_enabled": body.enabled,
+    })))
+}
+
+/// Email delivery worker: polls subscriptions with email enabled and sends
+/// notifications for pending events.  Respects the per-address daily limit.
+pub async fn run_email_delivery_worker(pool: PgPool) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let smtp_host = std::env::var("EMAIL_SMTP_HOST").unwrap_or_default();
+    let smtp_port: u16 = std::env::var("EMAIL_SMTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(587);
+    let smtp_user = std::env::var("EMAIL_SMTP_USER").ok();
+    let smtp_pass = std::env::var("EMAIL_SMTP_PASSWORD").ok();
+    let from = std::env::var("EMAIL_FROM").unwrap_or_else(|_| "noreply@soroban-pulse".to_string());
+
+    if smtp_host.is_empty() {
+        tracing::info!("EMAIL_SMTP_HOST not set — subscription email worker disabled");
+        return;
+    }
+
+    loop {
+        interval.tick().await;
+
+        // Fetch subscriptions with email enabled + pending delivery items.
+        let rows: Vec<(Uuid, String, Uuid, Value, i64)> = match sqlx::query_as(
+            "SELECT DISTINCT ON (s.id) s.id, s.email_address, dq.event_id, e.event_data, dq.ledger
+             FROM subscriptions s
+             JOIN delivery_queue dq ON dq.subscription_id = s.id
+             JOIN events e ON e.id = dq.event_id
+             WHERE s.email_enabled = true
+               AND s.email_address IS NOT NULL
+               AND s.status = 'active'
+               AND dq.status = 'pending'
+               AND dq.next_attempt_at <= NOW()
+             ORDER BY s.id, dq.ledger ASC
+             LIMIT 100",
+        )
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Email delivery worker DB error");
+                continue;
+            }
+        };
+
+        for (sub_id, email_addr, event_id, event_data, ledger) in rows {
+            match check_and_increment_email_rate_limit(&pool, &email_addr).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        email = %email_addr,
+                        "Daily email limit reached ({EMAIL_DAILY_LIMIT}/day), skipping"
+                    );
+                    crate::metrics::record_email_rate_limited();
+                    let _ = sqlx::query(
+                        "INSERT INTO email_delivery_log \
+                         (subscription_id, email_address, subject, status) \
+                         VALUES ($1, $2, 'Event notification', 'rate_limited')",
+                    )
+                    .bind(sub_id)
+                    .bind(&email_addr)
+                    .execute(&pool)
+                    .await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Email rate-limit check failed");
+                    continue;
+                }
+            }
+
+            let subject = format!("Soroban event at ledger {ledger}");
+            let body = format!(
+                "A Soroban contract event was detected at ledger {ledger}.\n\nEvent data:\n{}",
+                serde_json::to_string_pretty(&event_data).unwrap_or_default()
+            );
+
+            let send_result = send_smtp_email(
+                &smtp_host,
+                smtp_port,
+                smtp_user.as_deref(),
+                smtp_pass.as_deref(),
+                &from,
+                &email_addr,
+                &subject,
+                &body,
+            )
+            .await;
+
+            let (status, error_msg) = match send_result {
+                Ok(()) => {
+                    tracing::info!(email = %email_addr, ledger, "Email notification sent");
+                    crate::metrics::record_email_notification_sent();
+                    ("sent", None)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, email = %email_addr, "Email delivery failed");
+                    crate::metrics::record_email_failure();
+                    ("failed", Some(e))
+                }
+            };
+
+            let _ = sqlx::query(
+                "INSERT INTO email_delivery_log \
+                 (subscription_id, email_address, subject, status, error, sent_at) \
+                 VALUES ($1, $2, $3, $4, $5, CASE WHEN $4 = 'sent' THEN NOW() ELSE NULL END)",
+            )
+            .bind(sub_id)
+            .bind(&email_addr)
+            .bind(&subject)
+            .bind(status)
+            .bind(error_msg.as_deref())
+            .execute(&pool)
+            .await;
+
+            // Mark delivery_queue item as delivered on success.
+            if status == "sent" {
+                let _ = sqlx::query(
+                    "UPDATE delivery_queue SET status = 'delivered' \
+                     WHERE subscription_id = $1 AND event_id = $2",
+                )
+                .bind(sub_id)
+                .bind(event_id)
+                .execute(&pool)
+                .await;
+            }
+        }
+    }
+}
+
+/// Thin SMTP sender using lettre.
+async fn send_smtp_email(
+    smtp_host: &str,
+    smtp_port: u16,
+    smtp_user: Option<&str>,
+    smtp_password: Option<&str>,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    use lettre::{
+        message::header::ContentType, transport::smtp::authentication::Credentials, Message,
+        SmtpTransport, Transport,
+    };
+
+    let email = Message::builder()
+        .from(from.parse().map_err(|e| format!("invalid from: {e}"))?)
+        .to(to.parse().map_err(|e| format!("invalid to: {e}"))?)
+        .subject(subject)
+        .header(ContentType::TEXT_PLAIN)
+        .body(body.to_string())
+        .map_err(|e| format!("build email: {e}"))?;
+
+    let smtp_host_owned = smtp_host.to_string();
+    let creds = smtp_user.zip(smtp_password).map(|(u, p)| {
+        Credentials::new(u.to_string(), p.to_string())
+    });
+
+    tokio::task::spawn_blocking(move || {
+        let mut builder = SmtpTransport::relay(&smtp_host_owned)
+            .map_err(|e| format!("SMTP relay: {e}"))?
+            .port(smtp_port);
+        if let Some(c) = creds {
+            builder = builder.credentials(c);
+        }
+        builder
+            .build()
+            .send(&email)
+            .map(|_| ())
+            .map_err(|e| format!("SMTP send: {e}"))
+    })
+    .await
+    .map_err(|e| format!("task: {e}"))?
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

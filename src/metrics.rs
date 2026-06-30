@@ -192,6 +192,62 @@ pub fn record_email_bounce() {
     m::counter!("soroban_pulse_email_bounces_total").increment(1);
 }
 
+/// Issue #619: Record a successful subscription email notification delivery.
+pub fn record_email_notification_sent() {
+    m::counter!("soroban_pulse_subscription_email_sent_total").increment(1);
+}
+
+/// Issue #619: Record a rate-limited subscription email (daily cap hit).
+pub fn record_email_rate_limited() {
+    m::counter!("soroban_pulse_subscription_email_rate_limited_total").increment(1);
+}
+
+/// Issue #619: Record a subscription email config update.
+pub fn record_email_subscription_updated() {
+    m::counter!("soroban_pulse_subscription_email_config_updates_total").increment(1);
+}
+
+/// Issue #620: Record a successful push notification delivery.
+pub fn record_push_notification_sent(device_type: &str) {
+    m::counter!("soroban_pulse_push_sent_total", "device_type" => device_type.to_string())
+        .increment(1);
+}
+
+/// Issue #620: Record a failed push notification delivery.
+pub fn record_push_notification_failed(device_type: &str) {
+    m::counter!("soroban_pulse_push_failed_total", "device_type" => device_type.to_string())
+        .increment(1);
+}
+
+/// Issue #620: Record an invalid/expired push token cleanup.
+pub fn record_push_token_invalid() {
+    m::counter!("soroban_pulse_push_token_invalid_total").increment(1);
+}
+
+/// Issue #622: Update DB connection pool utilization percentage gauge.
+/// `max_connections` is passed in from config since PgPool does not expose it directly.
+pub fn update_pool_utilization(pool: &PgPool, max_connections: u32) {
+    let size = pool.size() as f64;
+    let idle = pool.num_idle() as f64;
+    let active = size - idle;
+    let max = max_connections as f64;
+    let utilization = if max > 0.0 { active / max } else { 0.0 };
+    m::gauge!("soroban_pulse_db_pool_utilization").set(utilization);
+    m::gauge!("soroban_pulse_db_pool_active_connections").set(active);
+    m::gauge!("soroban_pulse_db_pool_max_connections").set(max);
+}
+
+/// Issue #622: Record connection acquisition latency.
+pub fn record_pool_acquire_latency(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_db_pool_acquire_latency_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Issue #622: Record a pool exhaustion event (utilization >= 90%).
+pub fn record_pool_exhaustion_alert() {
+    m::counter!("soroban_pulse_db_pool_exhaustion_alerts_total").increment(1);
+}
+
 /// Record a full-text search query duration
 pub fn record_search_query_duration(duration: std::time::Duration) {
     m::histogram!("soroban_pulse_search_query_duration_seconds").record(duration.as_secs_f64());

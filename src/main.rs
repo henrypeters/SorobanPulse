@@ -59,6 +59,8 @@ mod replica_monitor;
 mod feature_flags;
 mod sse_ring_buffer;
 mod query_cache;
+mod push_notification;
+mod connection_pool;
 
 #[cfg(feature = "archive")]
 mod archiver;
@@ -378,6 +380,30 @@ async fn main() -> anyhow::Result<()> {
         } else {
             warn!("Twilio credentials set but SMS_TO_NUMBERS is empty — SMS notifications disabled");
         }
+    }
+
+    // Issue #619: Spawn subscription email delivery worker.
+    {
+        let email_pool = pool.clone();
+        tokio::spawn(subscriptions::run_email_delivery_worker(email_pool));
+    }
+
+    // Issue #620: Spawn push notification delivery worker.
+    {
+        let push_pool = pool.clone();
+        tokio::spawn(push_notification::run_push_delivery_worker(push_pool));
+    }
+
+    // Issue #622: Spawn connection pool monitor.
+    {
+        let pool_cfg = connection_pool::PoolMonitorConfig {
+            max_connections: config.db_max_connections,
+            min_connections: config.db_min_connections,
+            exhaustion_threshold: 0.9,
+            sample_interval: std::time::Duration::from_secs(15),
+        };
+        connection_pool::spawn_pool_monitor(pool.clone(), pool_cfg);
+        connection_pool::log_pool_snapshot(&pool, config.db_max_connections);
     }
 
     // Spawn Redis publisher if configured
