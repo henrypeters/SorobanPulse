@@ -1233,3 +1233,35 @@ pub struct ChannelGroupResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+
+// ── Issue #627: Contract existence check ─────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ContractExistsResponse {
+    pub contract_id: String,
+    /// true if the contract has indexed events, false otherwise
+    pub exists: bool,
+    /// "bloom_filter" or "database_query" indicating how the check was performed
+    pub method: String,
+}
+
+// ── Issue #631: Dynamic config reloading ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ConfigResponse {
+    pub log_level: String,
+    pub rate_limit_per_minute: u32,
+    pub sse_keepalive_secs: u64,
+    pub health_check_timeout_ms: u64,
+    pub db_max_connections: u32,
+    pub indexer_lag_warn_threshold: u64,
+    pub slow_query_threshold_ms: u64,
+    pub features: std::collections::HashMap<String, bool>,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ConfigReloadResponse {
+    pub success: bool,
+    pub message: String,
+    pub updated_fields: Vec<String>,
+}

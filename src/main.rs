@@ -11,9 +11,11 @@ mod config;
 mod content_filter;
 mod db;
 mod dedup;
+mod distributed_tracing;
 mod email;
 mod encryption;
 mod error;
+mod graceful_shutdown;
 mod handlers;
 mod index_monitor;
 mod indexer;
@@ -35,6 +37,7 @@ mod pubsub;
 mod queue_publisher;
 mod rate_limiter;
 mod reencrypt;
+mod resource_metrics;
 mod routes;
 mod rpc_client;
 mod schema_validator;
@@ -56,6 +59,8 @@ mod replica_monitor;
 mod feature_flags;
 mod sse_ring_buffer;
 mod query_cache;
+mod push_notification;
+mod connection_pool;
 
 #[cfg(feature = "archive")]
 mod archiver;
@@ -377,6 +382,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Issue #619: Spawn subscription email delivery worker.
+    {
+        let email_pool = pool.clone();
+        tokio::spawn(subscriptions::run_email_delivery_worker(email_pool));
+    }
+
+    // Issue #620: Spawn push notification delivery worker.
+    {
+        let push_pool = pool.clone();
+        tokio::spawn(push_notification::run_push_delivery_worker(push_pool));
+    }
+
+    // Issue #622: Spawn connection pool monitor.
+    {
+        let pool_cfg = connection_pool::PoolMonitorConfig {
+            max_connections: config.db_max_connections,
+            min_connections: config.db_min_connections,
+            exhaustion_threshold: 0.9,
+            sample_interval: std::time::Duration::from_secs(15),
+        };
+        connection_pool::spawn_pool_monitor(pool.clone(), pool_cfg);
+        connection_pool::log_pool_snapshot(&pool, config.db_max_connections);
+    }
+
     // Spawn Redis publisher if configured
     if let (Some(redis_url), Some(redis_stream_key)) = (&config.redis_url, &config.redis_stream_key)
     {
@@ -511,6 +540,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn feature flag rollback watcher (#587)
     feature_flags::spawn(pool.clone(), 60, shutdown_rx.clone());
+
+    // Spawn resource metrics collector (#630)
+    resource_metrics::spawn_resource_collector(shutdown_rx.clone());
 
     // Spawn materialized-view refresh background task
     stats_refresh::spawn(

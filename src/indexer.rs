@@ -9,7 +9,7 @@ use tokio::time::sleep;
 use tracing::{error, info, instrument, span, warn, Level};
 
 use crate::{
-    bloom_filter::EventBloomFilter,
+    bloom_filter::{EventBloomFilter, SessionBloomFilter},
     config::{Config, HealthState, IndexerState},
     kinesis::KinesisPublisher,
     metrics,
@@ -299,6 +299,8 @@ pub struct Indexer<R: RpcClient> {
     event_tx: Option<broadcast::Sender<SorobanEvent>>,
     event_counter: AtomicU64,
     bloom_filter: Option<Arc<EventBloomFilter>>,
+    /// Issue #615: session-level bloom filter reset on each new ledger.
+    session_bloom: SessionBloomFilter,
     kinesis_publisher: Option<Arc<dyn KinesisPublisher>>,
     pubsub_publisher: Option<Arc<dyn PubSubPublisher>>,
     sse_ring_buffer: Option<Arc<crate::sse_ring_buffer::SseRingBuffer>>,
@@ -327,6 +329,7 @@ impl<R: RpcClient> Indexer<R> {
             event_tx: None,
             event_counter: AtomicU64::new(0),
             bloom_filter: None,
+            session_bloom: SessionBloomFilter::new(50_000, 0.001),
             kinesis_publisher: None,
             pubsub_publisher: None,
             sse_ring_buffer: None,
@@ -1060,7 +1063,17 @@ impl<R: RpcClient> Indexer<R> {
         event: &SorobanEvent,
         schema_version: i32,
     ) -> Result<u64, anyhow::Error> {
-        // Issue #266: bloom filter pre-filter
+        // Issue #615: session-level bloom filter pre-filter (reset on new ledger)
+        if self.session_bloom.check_and_set(
+            &event.tx_hash,
+            &event.contract_id,
+            &event.event_type,
+            event.ledger,
+        ) {
+            return Ok(0);
+        }
+
+        // Issue #266: persistent bloom filter pre-filter
         if let Some(ref bloom) = self.bloom_filter {
             if bloom.check(&event.tx_hash, &event.contract_id, &event.event_type) {
                 return Ok(0);

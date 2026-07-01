@@ -33,6 +33,18 @@ __all__ = [
     "Event",
     "EventType",
     "PaginationParams",
+    # Retry policy exports
+    "RetryPolicy",
+    "RetryPolicyConfig",
+    "RetryMetrics",
+    "exponential_backoff",
+    "linear_backoff",
+    "immediate_retry",
+    "create_default_retry_policy",
+    "create_aggressive_retry_policy",
+    "create_conservative_retry_policy",
+    "get_global_retry_policy",
+    "reset_global_retry_policy",
 ]
 
 # import apis into sdk package
@@ -55,4 +67,20 @@ from openapi_client.models.contract_summary import ContractSummary as ContractSu
 from openapi_client.models.event import Event as Event
 from openapi_client.models.event_type import EventType as EventType
 from openapi_client.models.pagination_params import PaginationParams as PaginationParams
+
+# import retry policy support
+from openapi_client.retry_policy import (
+    RetryPolicy as RetryPolicy,
+    RetryPolicyConfig as RetryPolicyConfig,
+    RetryMetrics as RetryMetrics,
+    exponential_backoff as exponential_backoff,
+    linear_backoff as linear_backoff,
+    immediate_retry as immediate_retry,
+    create_default_retry_policy as create_default_retry_policy,
+    create_aggressive_retry_policy as create_aggressive_retry_policy,
+    create_conservative_retry_policy as create_conservative_retry_policy,
+    get_global_retry_policy as get_global_retry_policy,
+    reset_global_retry_policy as reset_global_retry_policy,
+)
+
 

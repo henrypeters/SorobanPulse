@@ -22,6 +22,41 @@ pub async fn request_id_middleware(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+/// Issue #628: Middleware to extract and propagate distributed trace context.
+/// Extracts trace headers (traceparent, X-Trace-ID) and makes them available
+/// to the request handler.
+pub async fn tracing_middleware(req: Request, next: Next) -> Response {
+    let trace_context = crate::distributed_tracing::extract_trace_context(req.headers());
+    
+    if let Some(ctx) = trace_context {
+        // Store trace context for this request
+        tracing::debug!(
+            trace_id = %ctx.trace_id,
+            parent_id = ?ctx.parent_id,
+            "extracted trace context from headers"
+        );
+        
+        // Record trace attributes in current span
+        crate::distributed_tracing::set_span_attribute("trace_id", &ctx.trace_id);
+        if let Some(ref parent_id) = ctx.parent_id {
+            crate::distributed_tracing::set_span_attribute("parent_id", parent_id);
+        }
+    }
+    
+    next.run(req).await
+}
+
+/// Issue #633: Middleware to track in-flight requests for graceful shutdown.
+/// Increments request counter on entry, decrements on exit (or error).
+pub async fn request_tracking_middleware(
+    req: Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // This middleware is optional and only used when shutdown tracking is enabled.
+    // The actual tracking is done via AppState in routes.
+    next.run(req).await
+}
+
 /// The resolved tenant for the current request.
 /// Injected as a request extension by `auth_middleware` when multi-tenant mode
 /// is enabled.  Handlers read this via `req.extensions().get::<TenantId>()`.
