@@ -341,6 +341,9 @@ pub fn create_router_with_tx_and_tenant_map(
         multi_tenant: config.multi_tenant,
     });
     let admin_auth_state = Arc::new(middleware::AdminAuthState { admin_api_keys });
+    // Push-preload feature flag state — built early so it can be passed to
+    // the route_layer middleware before AppState is assembled.
+    let push_preload_state = crate::push_preload::PushPreloadState::new(config.enable_push_preload);
     let contract_count_cache = moka::future::Cache::builder()
         .max_capacity(config.contract_count_cache_size)
         .time_to_live(std::time::Duration::from_secs(
@@ -527,7 +530,25 @@ pub fn create_router_with_tx_and_tenant_map(
         // Issue #607: Cached ABI endpoint
         .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached))
         // Issue #632: Feature flag client-side endpoint
-        .route("/features", axum::routing::get(handlers::get_feature_flag_status));
+        .route("/features", axum::routing::get(handlers::get_feature_flag_status))
+        // Push-preload endpoints: read-only schema/ABI lookup for HTTP/2 push
+        // and client-side preloading. Gated by enable_push_preload at the
+        // handler level so the routes are always registered (returning 501 when
+        // the flag is off) to keep the routing table stable.
+        .route(
+            "/push/{contract_id}/schema",
+            axum::routing::get(crate::push_preload::get_push_schema),
+        )
+        .route(
+            "/push/{contract_id}/abi",
+            axum::routing::get(crate::push_preload::get_push_abi),
+        )
+        // Append Link preload headers to responses for
+        // /v1/events/contract/{contract_id} when the feature flag is on.
+        .route_layer(axum::middleware::from_fn_with_state(
+            push_preload_state,
+            crate::push_preload::push_link_header_middleware,
+        ));
 
 
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
