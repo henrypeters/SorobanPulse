@@ -27,17 +27,52 @@ pub struct Subscription {
     pub acked_ledger: i64,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    pub subscription_type: String,
+    pub batch_size: i32,
+    pub batch_timeout_ms: i32,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSubscriptionRequest {
     pub callback_url: String,
     pub from_ledger: i64,
+    pub subscription_type: Option<String>,
+    pub batch_size: Option<i32>,
+    pub batch_timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AckRequest {
     pub ledger: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBatchConfigRequest {
+    pub subscription_type: Option<String>,
+    pub batch_size: Option<i32>,
+    pub batch_timeout_ms: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchDeliveryResponse {
+    pub subscription_id: Uuid,
+    pub batch: Vec<BatchEvent>,
+    pub batch_size: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchEvent {
+    pub event_id: Uuid,
+    pub ledger: i64,
+    pub event_data: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubscriptionBatchConfig {
+    pub subscription_id: Uuid,
+    pub subscription_type: String,
+    pub batch_size: i32,
+    pub batch_timeout_ms: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,12 +213,36 @@ pub async fn create_subscription(
         ));
     }
 
+    let subscription_type = body
+        .subscription_type
+        .as_deref()
+        .unwrap_or("single")
+        .to_string();
+    if subscription_type != "single" && subscription_type != "batch" {
+        return Err(AppError::Validation(
+            "subscription_type must be 'single' or 'batch'".into(),
+        ));
+    }
+
+    let batch_size = body
+        .batch_size
+        .unwrap_or(state.config.subscription_default_batch_size)
+        .clamp(1, 1000);
+    let batch_timeout_ms = body
+        .batch_timeout_ms
+        .unwrap_or(state.config.subscription_default_batch_timeout_ms)
+        .clamp(100, 60000);
+
     let sub: Subscription = sqlx::query_as(
-        "INSERT INTO subscriptions (callback_url, from_ledger) VALUES ($1, $2)
-         RETURNING id, callback_url, from_ledger, acked_ledger, status, created_at",
+        "INSERT INTO subscriptions (callback_url, from_ledger, subscription_type, batch_size, batch_timeout_ms)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, callback_url, from_ledger, acked_ledger, status, created_at, subscription_type, batch_size, batch_timeout_ms",
     )
     .bind(&body.callback_url)
     .bind(body.from_ledger)
+    .bind(&subscription_type)
+    .bind(batch_size)
+    .bind(batch_timeout_ms)
     .fetch_one(&state.pool)
     .await?;
 
@@ -206,7 +265,7 @@ pub async fn get_subscription(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
     let sub: Subscription = sqlx::query_as(
-        "SELECT id, callback_url, from_ledger, acked_ledger, status, created_at
+        "SELECT id, callback_url, from_ledger, acked_ledger, status, created_at, subscription_type, batch_size, batch_timeout_ms
          FROM subscriptions WHERE id = $1",
     )
     .bind(id)
@@ -285,6 +344,136 @@ pub async fn ack_subscription(
     Ok(Json(json!({ "acked_ledger": body.ledger })))
 }
 
+/// `GET /v1/subscriptions/{id}/batch` — return the batch configuration for a subscription.
+pub async fn get_subscription_batch_config(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let row: Option<(String, i32, i32)> = sqlx::query_as(
+        "SELECT subscription_type, batch_size, batch_timeout_ms
+         FROM subscriptions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (subscription_type, batch_size, batch_timeout_ms) = row.ok_or(AppError::NotFound)?;
+
+    Ok(Json(json!(SubscriptionBatchConfig {
+        subscription_id: id,
+        subscription_type,
+        batch_size,
+        batch_timeout_ms,
+    })))
+}
+
+/// `PUT /v1/subscriptions/{id}/batch` — update the batch configuration for a subscription.
+pub async fn update_subscription_batch_config(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateBatchConfigRequest>,
+) -> Result<Json<Value>, AppError> {
+    if let Some(ref st) = body.subscription_type {
+        if st != "single" && st != "batch" {
+            return Err(AppError::Validation(
+                "subscription_type must be 'single' or 'batch'".into(),
+            ));
+        }
+    }
+
+    let batch_size = body.batch_size.map(|s| s.clamp(1, 1000));
+    let batch_timeout_ms = body.batch_timeout_ms.map(|t| t.clamp(100, 60000));
+
+    let rows = sqlx::query(
+        "UPDATE subscriptions
+         SET subscription_type = COALESCE($2, subscription_type),
+             batch_size = COALESCE($3, batch_size),
+             batch_timeout_ms = COALESCE($4, batch_timeout_ms)
+         WHERE id = $1 AND status = 'active'",
+    )
+    .bind(id)
+    .bind(&body.subscription_type)
+    .bind(batch_size)
+    .bind(batch_timeout_ms)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    if rows == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    crate::metrics::record_batch_config_updated();
+
+    Ok(Json(json!({
+        "subscription_id": id,
+        "subscription_type": body.subscription_type,
+        "batch_size": batch_size,
+        "batch_timeout_ms": batch_timeout_ms,
+    })))
+}
+
+/// `POST /v1/subscriptions/{id}/batch` — deliver a batch of pending events for a batch subscription.
+/// Returns the current batch of pending events without marking them delivered.
+pub async fn deliver_batch(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let sub: Subscription = sqlx::query_as(
+        "SELECT id, callback_url, from_ledger, acked_ledger, status, created_at, subscription_type, batch_size, batch_timeout_ms
+         FROM subscriptions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    if sub.status != "active" {
+        return Err(AppError::Validation(
+            "subscription is not active".into(),
+        ));
+    }
+
+    if sub.subscription_type != "batch" {
+        return Err(AppError::Validation(
+            "subscription is not configured for batch delivery".into(),
+        ));
+    }
+
+    let batch_size = sub.batch_size as i64;
+    let rows: Vec<(Uuid, Uuid, Value, i64)> = sqlx::query_as(
+        "SELECT dq.id, dq.event_id, e.event_data, dq.ledger
+         FROM delivery_queue dq
+         JOIN events e ON e.id = dq.event_id
+         WHERE dq.subscription_id = $1
+           AND dq.status = 'pending'
+           AND dq.next_attempt_at <= NOW()
+         ORDER BY dq.ledger ASC
+         LIMIT $2",
+    )
+    .bind(id)
+    .bind(batch_size)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let events: Vec<BatchEvent> = rows
+        .into_iter()
+        .map(|(dq_id, event_id, event_data, ledger)| BatchEvent {
+            event_id,
+            ledger,
+            event_data,
+        })
+        .collect();
+
+    crate::metrics::record_batch_delivered(events.len() as u64);
+
+    Ok(Json(json!(BatchDeliveryResponse {
+        subscription_id: id,
+        batch_size: sub.batch_size,
+        batch: events,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Delivery worker
 // ---------------------------------------------------------------------------
@@ -321,9 +510,8 @@ pub async fn run_delivery_worker(pool: PgPool, http: reqwest::Client) {
 }
 
 async fn deliver_pending(pool: &PgPool, http: &reqwest::Client) -> Result<usize, sqlx::Error> {
-    // Fetch up to 50 pending items whose next_attempt_at is due
-    let rows: Vec<(Uuid, Uuid, String, Value, i64)> = sqlx::query_as(
-        "SELECT dq.id, dq.event_id, s.callback_url, e.event_data, dq.ledger
+    let rows: Vec<(Uuid, Uuid, String, Value, i64, String, i32, i32)> = sqlx::query_as(
+        "SELECT dq.id, dq.event_id, s.callback_url, e.event_data, dq.ledger, s.subscription_type, s.batch_size, s.batch_timeout_ms
          FROM delivery_queue dq
          JOIN subscriptions s ON s.id = dq.subscription_id
          JOIN events e ON e.id = dq.event_id
@@ -331,13 +519,28 @@ async fn deliver_pending(pool: &PgPool, http: &reqwest::Client) -> Result<usize,
            AND dq.next_attempt_at <= NOW()
            AND s.status = 'active'
          ORDER BY dq.ledger ASC
-         LIMIT 50",
+         LIMIT 200",
     )
     .fetch_all(pool)
     .await?;
 
-    let count = rows.len();
-    for (queue_id, event_id, callback_url, event_data, ledger) in rows {
+    let mut single_items: Vec<(Uuid, Uuid, String, Value, i64)> = Vec::new();
+    let mut batch_items: std::collections::HashMap<Uuid, Vec<(Uuid, Uuid, String, Value, i64, i32, i32)>> = std::collections::HashMap::new();
+
+    for (queue_id, event_id, callback_url, event_data, ledger, sub_type, batch_size, batch_timeout_ms) in rows {
+        if sub_type == "batch" {
+            batch_items
+                .entry(queue_id)
+                .or_default()
+                .push((queue_id, event_id, callback_url, event_data, ledger, batch_size, batch_timeout_ms));
+        } else {
+            single_items.push((queue_id, event_id, callback_url, event_data, ledger));
+        }
+    }
+
+    let mut total_delivered = 0;
+
+    for (queue_id, event_id, callback_url, event_data, ledger) in single_items {
         let payload = json!({ "event_id": event_id, "ledger": ledger, "event_data": event_data });
         match http
             .post(&callback_url)
@@ -351,6 +554,7 @@ async fn deliver_pending(pool: &PgPool, http: &reqwest::Client) -> Result<usize,
                     .bind(queue_id)
                     .execute(pool)
                     .await?;
+                total_delivered += 1;
             }
             Ok(resp) => {
                 let err = format!("HTTP {}", resp.status());
@@ -361,7 +565,63 @@ async fn deliver_pending(pool: &PgPool, http: &reqwest::Client) -> Result<usize,
             }
         }
     }
-    Ok(count)
+
+    for (_, items) in batch_items {
+        if items.is_empty() {
+            continue;
+        }
+
+        let callback_url = items[0].2.clone();
+        let batch_size = items[0].5;
+        let batch_timeout_ms = items[0].6;
+
+        let batch_items_to_send: Vec<_> = items.into_iter().take(batch_size as usize).collect();
+        let events: Vec<Value> = batch_items_to_send
+            .iter()
+            .map(|(_, event_id, _, event_data, ledger, _, _)| {
+                json!({ "event_id": event_id, "ledger": ledger, "event_data": event_data })
+            })
+            .collect();
+
+        let payload = json!({ "events": events, "batch_size": batch_size });
+
+        let timeout = Duration::from_millis(batch_timeout_ms as u64);
+        match http
+            .post(&callback_url)
+            .json(&payload)
+            .timeout(timeout)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let queue_ids: Vec<Uuid> = batch_items_to_send.iter().map(|(qid, _, _, _, _, _, _)| *qid).collect();
+                sqlx::query(
+                    "UPDATE delivery_queue SET status = 'delivered' WHERE id = ANY($1)"
+                )
+                .bind(&queue_ids)
+                .execute(pool)
+                .await?;
+                total_delivered += queue_ids.len();
+                crate::metrics::record_batch_delivered(queue_ids.len() as u64);
+            }
+            Ok(resp) => {
+                let err = format!("HTTP {}", resp.status());
+                for (queue_id, _, _, _, _, _, _) in batch_items_to_send {
+                    schedule_retry(pool, queue_id, &err).await?;
+                }
+                crate::metrics::record_batch_delivery_failed();
+            }
+            Err(e) => {
+                let err = e.to_string();
+                for (queue_id, _, _, _, _, _, _) in batch_items_to_send {
+                    schedule_retry(pool, queue_id, &err).await?;
+                }
+                crate::metrics::record_batch_delivery_failed();
+            }
+        }
+    }
+
+    Ok(total_delivered)
 }
 
 /// Exponential backoff: 2^attempts seconds, capped at 1 hour.

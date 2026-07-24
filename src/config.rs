@@ -411,6 +411,12 @@ pub struct Config {
     pub query_cache_ttl_secs: u64,
     /// Maximum number of cached query results.
     pub query_cache_max_capacity: u64,
+
+    // Subscription batch delivery defaults
+    /// Default batch_size for new batch subscriptions.
+    pub subscription_default_batch_size: i32,
+    /// Default batch_timeout_ms for new batch subscriptions.
+    pub subscription_default_batch_timeout_ms: i32,
 }
 
 impl Default for Config {
@@ -554,6 +560,8 @@ impl Default for Config {
             sse_ring_buffer_capacity: crate::sse_ring_buffer::DEFAULT_RING_BUFFER_CAPACITY,
             query_cache_ttl_secs: crate::query_cache::DEFAULT_TTL_SECS,
             query_cache_max_capacity: crate::query_cache::DEFAULT_MAX_CAPACITY,
+            subscription_default_batch_size: 10,
+            subscription_default_batch_timeout_ms: 5000,
         }
     }
 }
@@ -1560,6 +1568,14 @@ impl Config {
             query_cache_max_capacity: env_or_file("QUERY_CACHE_MAX_CAPACITY", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(crate::query_cache::DEFAULT_MAX_CAPACITY),
+            subscription_default_batch_size: env_or_file("SUBSCRIPTION_DEFAULT_BATCH_SIZE", &file)
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(10)
+                .clamp(1, 1000),
+            subscription_default_batch_timeout_ms: env_or_file("SUBSCRIPTION_DEFAULT_BATCH_TIMEOUT_MS", &file)
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(5000)
+                .clamp(100, 60000),
         }
     }
 }

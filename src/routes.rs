@@ -500,6 +500,8 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/subscriptions/{id}/email", get(subscriptions::get_subscription_email).put(subscriptions::update_subscription_email))
         // Issue #620: Push notification config for subscriptions
         .route("/subscriptions/{id}/push", get(crate::push_notification::get_subscription_push).put(crate::push_notification::update_subscription_push))
+        // Issue #628: Batch subscription config and delivery
+        .route("/subscriptions/{id}/batch", get(subscriptions::get_subscription_batch_config).put(subscriptions::update_subscription_batch_config).post(subscriptions::deliver_batch))
         // Issue #487: email open tracking (public – email clients fetch the pixel)
         .route("/notifications/email/track/{token}", get(handlers::track_email_open))
         // Issue #487: email open stats (admin)

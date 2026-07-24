@@ -723,6 +723,22 @@ pub fn record_rpc_health_error(response_time_ms: u64) {
     m::histogram!("soroban_pulse_rpc_health_check_duration_ms").record(response_time_ms as f64);
 }
 
+/// Record a successful batch delivery of N events.
+pub fn record_batch_delivered(count: u64) {
+    m::counter!("soroban_pulse_batch_delivered_total").increment(count);
+    m::counter!("soroban_pulse_batch_deliveries_total").increment(1);
+}
+
+/// Record a failed batch delivery attempt.
+pub fn record_batch_delivery_failed() {
+    m::counter!("soroban_pulse_batch_delivery_failures_total").increment(1);
+}
+
+/// Record a batch config update.
+pub fn record_batch_config_updated() {
+    m::counter!("soroban_pulse_batch_config_updates_total").increment(1);
+}
+
 // ── Issue #630: Resource utilization metrics ────────────────────────────────
 
 /// Update file descriptor count gauge
